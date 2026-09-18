@@ -32,7 +32,7 @@ That produces:
 
 | build | command | log |
 |---|---|---|
-| **player** | `cargo build --release --target x86_64-pc-windows-gnu --no-default-features` | a handful of one-shot lines per session |
+| **player** | `cargo build --release --target x86_64-pc-windows-gnu --no-default-features` | minimal logging |
 | **debug** (default) | `cargo build --release --target x86_64-pc-windows-gnu` | full diagnostic dumps |
 
 ## Usage
