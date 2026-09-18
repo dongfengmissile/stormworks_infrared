@@ -9,10 +9,11 @@ name = "StormworksInfrared"
 crate-type = ["cdylib"]
 
 [features]
-# Verbose diagnostics in infrared_bootstrap.log (throttled scan dumps, sun/
-# weather/container dumps). The player build is `--no-default-features`:
-# only the one-shot bootstrap and hook status lines are written.
-default = ["logging"]
+# The `logging` cfg (verbose diagnostics: throttled scan dumps, sun/weather/
+# container dumps) is set from the cargo profile by build.rs — `cargo build`
+# builds verbose, `cargo build --release` builds the quiet player variant.
+# It is declared here so `--features logging` can force it in any profile and
+# so rustc's check-cfg knows the cfg is legitimate.
 logging = []
 
 [[bin]]

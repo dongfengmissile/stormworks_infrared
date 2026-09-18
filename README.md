@@ -12,15 +12,24 @@ stormworks-infrared uses low-level techniques (DLL injection + function hooking)
 - **Antivirus software might flag it.** Injecting into another process is exactly what malware does, so this is expected. If you want to be sure what it does, read the source and build it yourself.
 - It does not modify any game files on disk.
 
+## Download
+
+Latest release: https://github.com/dongfengmissile/stormworks_infrared/releases/latest
+
 ## Build
 
 Requires the Rust toolchain and the GNU Windows cross target:
 
 ```
 rustup target add x86_64-pc-windows-gnu
-cargo build --release --target x86_64-pc-windows-gnu (debug build)
-or 
-cargo build --release --target x86_64-pc-windows-gnu --no-default-features (release build, minimal logs)
+cargo build --target x86_64-pc-windows-gnu
+```
+
+or:
+
+```
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 That produces:
@@ -31,6 +40,7 @@ That produces:
 ```
 
 ## Usage
+
 1. Start Stormworks and load into a world.
 2. Inject `StormworksInfrared.dll` into `stormworks64.exe` — either with the bundled `infrared_inject.exe` or any other DLL injector.
 
@@ -42,7 +52,7 @@ You should see a line in the log confirming the hooks installed and the `ir` tab
 <Stormworks install>/logs/infrared_bootstrap.log
 ```
 
-The log is truncated on every launch, so it only ever contains the current session. The **debug build** additionally carries a throttled diagnostic dump (weather, sun, scan direction, source list) — that's the first place to look if a component seems to see nothing. The player build writes only the bootstrap lines.
+The debug build additionally carries a throttled diagnostic dump (weather, sun, scan direction, source list) — that's the first place to look if a component seems to see nothing. The player build writes only the bootstrap lines.
 
 ## Lua API
 
@@ -64,8 +74,8 @@ ir.scan(az_steer, el_steer, fov, range, rx, ry, gain, detect, axis, occlusion, p
 | `rx`, `ry` | cell grid, `rx*ry` cells |
 | `gain` | IR gain — the flux that maps to full-scale white |
 | `detect` | detect threshold in raw flux (the component applies it) |
-| `axis` | component-local forward axis: `0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z`. The game's missile-seeker meshes face **+Y**, so use `2` |
-| `occlusion` | `1` = drop sources blocked by terrain/vehicle hulls, `0` = off |
+| `axis` | component-local forward axis: `0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z` |
+| `occlusion` | `1` = use occlusion, `0` = off |
 | `pack` | pack 2 cells per float (12-bit each) when the grid exceeds one composite (33–64 cells) |
 
 Returns:
@@ -93,11 +103,11 @@ local cells, az_err, el_err, strength, flux = ir.scan(
 
 ## What the seeker sees
 
-- **Heat sources** — engines, furnaces, lava, anything the game tracks heat for. Emission is real in-band MWIR (3–5 µm) blackbody radiance, so a 400 °C furnace is hundreds of times brighter than a warm engine and can be picked up kilometres away, instead of needing to be close.
-- **Fires and flares** — a lit flare registers as a fire, so it works as an IR countermeasure, but only once it is inside the acquisition cone.
-- **The sun** — a genuine emitter driven by the game's own sun position, bright enough to decoy a missile, and blocked by terrain.
-- **Weather** — fog and rain attenuate every emitter, fog far more than rain, matching how you'd expect an IR seeker to degrade in bad weather.
-- **Occlusion** — players, terrain, buildings and vehicle hulls block sources via the game's own physics raycast. Clouds do **not** occlude.
+- **Heat sources** — engines, furnaces, lava, anything the game tracks heat for. Emission is real in-band MWIR (3–5 µm) blackbody radiance, so a 400 °C target is hundreds of times brighter than a warm engine and can be picked up kilometres away, instead of needing to be close
+- **Fires and flares** — a lit flare registers as a fire, so it works as an IR countermeasure, but only once it is inside the acquisition cone
+- **The sun** — bright enough to decoy a missile and blocked by terrain
+- **Weather** — fog and rain attenuate every emitter, fog far more than rain
+- **Occlusion** — players, terrain, buildings and vehicle hulls block sources via the game's raycast
 
 ## Game updates
 
