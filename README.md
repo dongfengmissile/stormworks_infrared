@@ -18,22 +18,17 @@ Requires the Rust toolchain and the GNU Windows cross target:
 
 ```
 rustup target add x86_64-pc-windows-gnu
-cargo build --release --target x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu (debug build)
+or 
+cargo build --release --target x86_64-pc-windows-gnu --no-default-features (release build, minimal logs)
 ```
 
 That produces:
 
-| artifact | what it is |
-|---|---|
-| `target/x86_64-pc-windows-gnu/release/StormworksInfrared.dll` | the plugin |
-| `target/x86_64-pc-windows-gnu/release/infrared_inject.exe` | a minimal injector, if you don't already have one |
-
-### Builds
-
-| build | command | log |
-|---|---|---|
-| **player** | `cargo build --release --target x86_64-pc-windows-gnu --no-default-features` | minimal logging |
-| **debug** (default) | `cargo build --release --target x86_64-pc-windows-gnu` | full diagnostic dumps |
+```
+ target/x86_64-pc-windows-gnu/release/StormworksInfrared.dll -> plugin
+ target/x86_64-pc-windows-gnu/release/infrared_inject.exe -> minimal injector if you don't have one
+```
 
 ## Usage
 1. Start Stormworks and load into a world.
