@@ -1,4 +1,4 @@
-# infrared
+# stormworks-infrared
 
 A plugin for [Stormworks: Build and Rescue](https://store.steampowered.com/app/573090/Stormworks_Build_and_Rescue/) that exposes the game's **own heat and temperature system** to component-mod Lua scripts. It adds a global `ir` table, so custom components can build real infrared seekers, heat detectors and homing guidance.
 
@@ -6,13 +6,11 @@ Targets the 64-bit Windows build (`stormworks64.exe`), whether it runs natively 
 
 ## READ THIS FIRST
 
-infrared uses low-level techniques (DLL injection + function hooking) to extend the game, because there is no supported way to do it.
+stormworks-infrared uses low-level techniques (DLL injection + function hooking) to extend the game, because there is no supported way to do it.
 
 - No guarantees about stability. Every function the plugin hooks is verified against a known byte pattern first, and if it doesn't match (usually after a game update) that hook is skipped and the plugin says so in its log instead of patching blindly — but injection itself can still be a bad time.
-- **Antivirus software will likely flag it.** Injecting into another process is exactly what malware does, so this is expected. If you want to be sure what it does, read the source and build it yourself.
-- It does not modify any Stormworks files on disk.
-
-This is not a cheating or griefing tool. It is intended for single-player and host use: the game evaluates temperature and fires on the simulation side, so an injected client in a multiplayer session has no game state to read in the first place.
+- **Antivirus software might flag it.** Injecting into another process is exactly what malware does, so this is expected. If you want to be sure what it does, read the source and build it yourself.
+- It does not modify any game files on disk.
 
 ## Build
 
@@ -30,24 +28,16 @@ That produces:
 | `target/x86_64-pc-windows-gnu/release/StormworksInfrared.dll` | the plugin |
 | `target/x86_64-pc-windows-gnu/release/infrared_inject.exe` | a minimal injector, if you don't already have one |
 
-The DLL links only Windows system libraries — there is no CRT or libstdc++ to ship alongside it.
-
 ### Builds
-
-There are two variants:
 
 | build | command | log |
 |---|---|---|
 | **player** | `cargo build --release --target x86_64-pc-windows-gnu --no-default-features` | a handful of one-shot lines per session |
 | **debug** (default) | `cargo build --release --target x86_64-pc-windows-gnu` | full diagnostic dumps |
 
-Both compile to the same file name, so rename one if you want both in the game directory at once — the convention here is `StormworksInfrared.dll` (player) and `StormworksInfrared_Debug.dll` (debug). The player build compiles the diagnostic machinery out entirely: a long session leaves a log of a few lines, not megabytes of scan dumps meant for development.
-
 ## Usage
-
-1. Build the DLL (or grab a release) and have it somewhere on disk.
-2. Start Stormworks and load into a world.
-3. Inject `StormworksInfrared.dll` into `stormworks64.exe` — either with the bundled `infrared_inject.exe` or any other DLL injector.
+1. Start Stormworks and load into a world.
+2. Inject `StormworksInfrared.dll` into `stormworks64.exe` — either with the bundled `infrared_inject.exe` or any other DLL injector.
 
 On Linux, the game runs under Proton, so the injector has to run inside the same Proton prefix Steam created for Stormworks (573090) rather than a bare WINE prefix.
 
@@ -58,8 +48,6 @@ You should see a line in the log confirming the hooks installed and the `ir` tab
 ```
 
 The log is truncated on every launch, so it only ever contains the current session. The **debug build** additionally carries a throttled diagnostic dump (weather, sun, scan direction, source list) — that's the first place to look if a component seems to see nothing. The player build writes only the bootstrap lines.
-
-The plugin doesn't touch any files on disk, so you have to inject again after every game launch.
 
 ## Lua API
 
@@ -114,7 +102,7 @@ local cells, az_err, el_err, strength, flux = ir.scan(
 - **Fires and flares** — a lit flare registers as a fire, so it works as an IR countermeasure, but only once it is inside the acquisition cone.
 - **The sun** — a genuine emitter driven by the game's own sun position, bright enough to decoy a missile, and blocked by terrain.
 - **Weather** — fog and rain attenuate every emitter, fog far more than rain, matching how you'd expect an IR seeker to degrade in bad weather.
-- **Occlusion** — terrain, buildings and vehicle hulls block sources via the game's own physics raycast. Clouds do **not** occlude.
+- **Occlusion** — players, terrain, buildings and vehicle hulls block sources via the game's own physics raycast. Clouds do **not** occlude.
 
 ## Game updates
 
