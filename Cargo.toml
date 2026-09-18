@@ -1,0 +1,32 @@
+[package]
+name = "stormworks_infrared"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "StormworksInfrared"
+crate-type = ["cdylib"]
+
+[features]
+# Verbose diagnostics in infrared_bootstrap.log (throttled scan dumps, sun/
+# weather/container dumps). The player build is `--no-default-features`:
+# only the one-shot bootstrap and hook status lines are written.
+default = ["logging"]
+logging = []
+
+[[bin]]
+name = "infrared_inject"
+path = "src/bin/infrared_inject.rs"
+
+[target.'cfg(windows)'.dependencies]
+minhook = "0.9"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }

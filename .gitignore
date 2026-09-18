@@ -1,0 +1,57 @@
+# ---------------------------------------------------------------------------
+# thermal_get — files that must never be published
+# ---------------------------------------------------------------------------
+
+# Rust build output (machine-specific, huge, includes the built DLL/EXE)
+/target/
+**/*.rs.bk
+*.pdb
+
+# Built plugin + injector binaries — publish source, let users build
+*.dll
+*.exe
+*.lib
+*.exp
+*.obj
+
+# Runtime logs (these land in the game directory, not here, but be safe)
+*.log
+logs/
+
+# Local reverse-engineering notes.
+# Exact addresses, symbol names and structure offsets into stormworks64.exe
+# are kept local on purpose: they are build-specific, they go stale with every
+# game update, and publishing a map of the executable is an invitation for
+# takedown requests. Do not commit these.
+re_notes.md
+dev_notes.md
+RE_NOTES.md
+DEV_NOTES.md
+notes/
+*.local.md
+
+# Game assets. NEVER commit: extracted or vendored copies of the game's
+# meshes/textures/shaders/animations are copyrighted material and are the one
+# thing here that would actually justify a DMCA claim. Reference the user's
+# own game installation instead.
+*.mesh
+*.txtr
+*.anim
+*.glslf
+*.glslv
+*.bin
+meshes/
+rom/
+
+# Machine / environment specifics
+.env
+*.env.local
+
+# Editor and OS junk
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
