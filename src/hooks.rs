@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use minhook::MinHook;
 
-use crate::api::register_ir_table;
+use crate::api::{register_ir_screen_table, register_ir_table};
 use crate::heat::cache_variant;
 #[cfg(feature = "logging")]
 use crate::heat::{log_fires_container, log_heat_container, log_volume_heat_sources};
@@ -28,6 +28,23 @@ pub(crate) extern "C" fn ir_registrar_hook(context: usize) {
     }
     unsafe { register_ir_table(context) };
     REGISTRAR_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Screen / microcontroller Lua initializer (it builds `debug`, `async`,
+/// `screen`).
+///
+/// `ir` is registered here as well as in the component-mod environment, because
+/// a microcontroller script is where `screen.*` lives and the image therefore
+/// has to be drawn from there. Only the component-independent calls are
+/// exposed - see register_ir_screen_table.
+pub(crate) extern "C" fn ir_screen_init_hook(state: usize) {
+    let original = ORIG_SCREEN_INIT.load(Ordering::SeqCst);
+    if original != 0 {
+        let f: unsafe extern "C" fn(usize) = unsafe { std::mem::transmute(original) };
+        unsafe { f(state) };
+    }
+    unsafe { register_ir_screen_table(state) };
+    SCREEN_INIT_HITS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Per-tick exhaust plume update: (emitter, world position, ..., rate pointer, ...).
@@ -515,7 +532,7 @@ fn note_rejection(_message: &str) {}
 /// A component pointer is only trusted when its vtable points into the image;
 /// some call sites pass something else entirely (they showed up as vt=0x0
 /// samples with garbage fields).
-unsafe fn looks_like_component(component: usize) -> bool {
+pub(crate) unsafe fn looks_like_component(component: usize) -> bool {
     if component < 0x10000 {
         return false;
     }
@@ -1322,6 +1339,33 @@ pub(crate) unsafe fn install_hooks() -> Result<(), String> {
             "frame uniforms prologue mismatch at {frame_uniforms:#x}; this build is not {GAME_BUILD_LABEL}"
         ));
     }
+    // The drawing environment's initializer. Deliberately non-fatal: if this
+    // prologue ever mismatches, the seeker and every other hook must still
+    // install, and only the on-screen image is lost.
+    let screen_init = base + RVA_LUA_SCREEN_INIT;
+    if !bytes_match(screen_init, &SCREEN_INIT_PROLOGUE) {
+        log_line(&format!(
+            "screen Lua init prologue mismatch at {screen_init:#x}; ir.frame will not reach microcontroller scripts"
+        ));
+    } else if crate::state::SCREEN_HOOKS_DISABLED.load(Ordering::SeqCst) {
+        log_line("screen Lua init hook disabled by request");
+    } else {
+        match MinHook::create_hook(
+            screen_init as *mut c_void,
+            ir_screen_init_hook as *const c_void as *mut c_void,
+        ) {
+            Ok(original) => {
+                ORIG_SCREEN_INIT.store(original as usize, Ordering::SeqCst);
+                if let Err(status) = MinHook::enable_hook(screen_init as *mut c_void) {
+                    log_line(&format!("MinHook enable_hook(screen Lua init) failed: {status}"));
+                }
+            }
+            Err(status) => log_line(&format!(
+                "MinHook create_hook(screen Lua init) failed: {status}"
+            )),
+        }
+    }
+
     if crate::state::EXHAUST_HOOKS_DISABLED.load(Ordering::SeqCst) {
         return Ok(());
     }

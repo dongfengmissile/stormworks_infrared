@@ -2,6 +2,7 @@
 //! the Lua API. Kept separate from `offsets` so the layout of the game is
 //! never mixed with our own runtime bookkeeping.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize};
 use std::sync::Mutex;
@@ -17,6 +18,15 @@ pub(crate) static ORIG_SCENE_TICK: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static SCENE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static HOOKS_INSTALLED: AtomicBool = AtomicBool::new(false);
 pub(crate) static REGISTRAR_HITS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static ORIG_SCREEN_INIT: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static SCREEN_INIT_HITS: AtomicUsize = AtomicUsize::new(0);
+/// Each seeker's last rendered image, published for the drawing
+/// (microcontroller) Lua environment, keyed by the channel its script scans on:
+/// (width, height, one 0..255 value per cell, row-major). A vehicle can carry
+/// several seekers, so this is a map rather than one slot - otherwise the last
+/// seeker to tick would overwrite the others.
+pub(crate) static LAST_FRAME: Mutex<BTreeMap<u32, (i32, i32, Vec<u8>)>> =
+    Mutex::new(BTreeMap::new());
 pub(crate) static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 // Exhaust-emitter capture: the creation hook records each emitter's effect
@@ -29,6 +39,7 @@ pub(crate) static JET_HOOKS_DISABLED: AtomicBool = AtomicBool::new(false);
 pub(crate) static PRESET_HOOKS_DISABLED: AtomicBool = AtomicBool::new(false);
 pub(crate) static MODULAR_HOOKS_DISABLED: AtomicBool = AtomicBool::new(false);
 pub(crate) static FLUID_HOOKS_DISABLED: AtomicBool = AtomicBool::new(false);
+pub(crate) static SCREEN_HOOKS_DISABLED: AtomicBool = AtomicBool::new(false);
 pub(crate) static ORIG_EXHAUST_UPDATE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static ORIG_ROCKET_TICK: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static ORIG_JET_TICK: AtomicUsize = AtomicUsize::new(0);

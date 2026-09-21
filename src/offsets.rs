@@ -9,6 +9,11 @@ pub(crate) const GAME_BUILD_LABEL: &str = "f9206d85c82f";
 
 // RVAs (image base 0x140000000).
 pub(crate) const RVA_COMPONENT_LUA_REGISTRAR: usize = 0x0032_be50; // FUN_14032be50
+// The screen/microcontroller Lua initializer: it builds the `debug`, `async` and
+// `screen` tables, so it is the state an on-screen image has to be drawn from.
+// The component-mod registrar above only reaches component scripts, which cannot
+// draw, and its state has no screen API.
+pub(crate) const RVA_LUA_SCREEN_INIT: usize = 0x002e_5230; // FUN_1402e5230
 pub(crate) const RVA_TEMPERATURE: usize = 0x0030_fd60; // FUN_14030fd60
 pub(crate) const RVA_ARG_SLOT: usize = 0x0009_7920; // FUN_140097920
 pub(crate) const RVA_PUSH_STRING: usize = 0x0009_7f60; // FUN_140097f60
@@ -74,6 +79,19 @@ pub(crate) const FLUID_TEMP_OFFSET: usize = 0x240;
 pub(crate) const ENGINE_MIN_TEMP_C: f64 = 25.0;
 /// Kept as the preset engine's own name for the same threshold.
 pub(crate) const PRESET_ENGINE_MIN_C: f64 = ENGINE_MIN_TEMP_C;
+
+/// A seeker's identity is 24 bits: an f32 carries an integer exactly to 2^24, so
+/// it survives the trip through a composite as a single number. It is not chosen
+/// by hand - it is derived from the component - so two live seekers only collide
+/// if their mixed pointers do (about 1 in 16.7 million per pair), and a collision
+/// only misroutes a display image: the guidance numbers travel on the seeker's
+/// own composite wire, not through this id.
+pub(crate) const FRAME_ID_MAX: u32 = 0xff_ffff;
+/// Cap on the id -> frame map. Ids come from component pointers and a long
+/// session destroys and respawns vehicles, so the map is bounded rather than
+/// left to grow; on overflow it is cleared, which costs one frame because every
+/// live seeker republishes on its next scan.
+pub(crate) const FRAME_MAP_MAX: usize = 64;
 pub(crate) const PRESET_ENGINE_TICK_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
     0x41, 0x57, 0x48, 0x8d, 0xa8, 0x48, 0xfe, 0xff, 0xff, 0x48, 0x81, 0xec, 0x80, 0x02, 0x00, 0x00,
@@ -164,6 +182,11 @@ pub(crate) const COMPONENT_MATRIX_OFFSET: usize = 0x1e8;
 pub(crate) const REGISTRAR_PROLOGUE: [u8; 32] = [
     0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x55, 0x57, 0x41, 0x56, 0x48, 0x8d,
     0xac, 0x24, 0x50, 0xfc, 0xff, 0xff, 0x48, 0x81, 0xec, 0xb0, 0x04, 0x00, 0x00, 0x48, 0x8b, 0x05,
+];
+/// Same shape as the component-mod registrar, with a smaller stack frame (0x320).
+pub(crate) const SCREEN_INIT_PROLOGUE: [u8; 32] = [
+    0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x55, 0x57, 0x41, 0x56, 0x48, 0x8d,
+    0xac, 0x24, 0xe0, 0xfd, 0xff, 0xff, 0x48, 0x81, 0xec, 0x20, 0x03, 0x00, 0x00, 0x48, 0x8b, 0x05,
 ];
 pub(crate) const TEMPERATURE_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x70, 0x20, 0x57,

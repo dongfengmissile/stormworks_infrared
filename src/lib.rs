@@ -107,6 +107,7 @@ fn bootstrap() {
                 let steam = crate::state::STEAM_TICK_CALLS.load(Ordering::Relaxed);
                 let jet = crate::state::JET_TICK_CALLS.load(Ordering::Relaxed);
                 let rocket = crate::state::ROCKET_TICK_CALLS.load(Ordering::Relaxed);
+                let screen = crate::state::SCREEN_INIT_HITS.load(Ordering::Relaxed);
                 let samples = crate::state::ENGINE_SAMPLES
                     .lock()
                     .map(|s| s.len())
@@ -119,7 +120,7 @@ fn bootstrap() {
                     let _ = writeln!(
                         file,
                         "heartbeat {beat}: hooks={} calls custom={custom} preset={preset} fluid={fluid} \
-steam={steam} jet={jet} rocket={rocket} samples={samples}",
+steam={steam} jet={jet} rocket={rocket} screen={screen} samples={samples}",
                         crate::state::HOOKS_INSTALLED.load(Ordering::Relaxed) as u8
                     );
                 }
@@ -176,11 +177,17 @@ steam={steam} jet={jet} rocket={rocket} samples={samples}",
         crate::state::FLUID_HOOKS_DISABLED.store(true, Ordering::SeqCst);
         log_line("fluid (water/steam) tick hooks disabled by request");
     }
+    if std::env::var("INFRARED_NO_SCREEN").as_deref() == Ok("1")
+        || plugin_dir.join("infrared_disable_screen").exists()
+    {
+        crate::state::SCREEN_HOOKS_DISABLED.store(true, Ordering::SeqCst);
+        log_line("screen Lua init hook disabled by request");
+    }
 
     match unsafe { install_hooks() } {
         Ok(()) => log_line(
-            "hooks installed (registrar, temperature, fires, scene, sun, frame uniforms, \
-rocket/jet/preset/modular/water/steam ticks, exhaust)",
+            "hooks installed (registrar, screen Lua init, temperature, fires, scene, sun, frame \
+uniforms, rocket/jet/preset/modular/water/steam ticks, exhaust)",
         ),
         Err(error) => {
             log_line(&format!("hook installation failed: {error}"));

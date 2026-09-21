@@ -1,16 +1,15 @@
--- Component Lua, not for use in stormworks MCs
+-- Component lua, used on my published IR seekers
 NODE_CONFIG   = 0
-NODE_ARRAY    = 0
+NODE_DATA     = 0
 NODE_STRENGTH = 0
 NODE_DETECT   = 0
-
-RES_X = 4
-RES_Y = 4 -- cells = RES_X*RES_Y; 33->64 cells auto-encode as 2 cells/float (12-bit each) so one composite still carries them (see ir_array_to_screen for decoding)
+RES_X = 16
+RES_Y = 16
 FOV_TURNS = 0.0125
-RANGE_M = 1000.0 -- max detection distance (m)
-IR_GAIN = 0.005 -- total flux that maps to full-scale white
-DETECT_FLUX = 0.001 -- total flux needed for Target Detect
-OCCLUSION = true -- line-of-sight check through the physics world
+RANGE_M = 5000.0
+IR_GAIN = 0.005
+DETECT_FLUX = 0.001
+OCCLUSION = true
 FORWARD_AXIS = 2 -- 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
 
 function onAddToSimulation() end
@@ -24,6 +23,9 @@ function onTick(tick_time)
 	el    = 0.0
 	gain  = IR_GAIN
 	dflux = DETECT_FLUX
+	rx    = RES_X
+	ry    = RES_Y
+	seeker_id = 0
 	occl  = 1.0
 	if not OCCLUSION then
 		occl = 0.0
@@ -38,7 +40,13 @@ function onTick(tick_time)
 		if f[4] ~= nil then el = f[4] end
 		if f[5] ~= nil and f[5] > 0 then gain = f[5] end
 		if f[6] ~= nil and f[6] > 0 then dflux = f[6] end
+		if f[7] ~= nil and f[7] > 0 then rx = math.floor(f[7] + 0.5) end
+		if f[8] ~= nil and f[8] > 0 then ry = math.floor(f[8] + 0.5) end
 	end
+	if rx < 1 then rx = 1 end
+	if rx > 64 then rx = 64 end
+	if ry < 1 then ry = 1 end
+	if ry > 64 then ry = 64 end
 
 	cells    = nil
 	az_err   = 0.0
@@ -47,10 +55,8 @@ function onTick(tick_time)
 	detect   = false
 
 	if ir ~= nil and ir.scan ~= nil then
-		pack = RES_X * RES_Y > 32
-		cells, az_err, el_err, peak_abs, flux, ambient =
-			ir.scan(az, el, fov, range, RES_X, RES_Y, gain, dflux, FORWARD_AXIS, occl, pack)
-		-- Strength is the received IR flux over the gain (0->1); Detect is an absolute threshold on the received IR flux.
+		cells, az_err, el_err, peak_abs, flux, ambient, n_sources, seeker_id =
+			ir.scan(az, el, fov, range, rx, ry, gain, dflux, FORWARD_AXIS, occl, false, false)
 		if flux ~= nil then
 			strength = flux / gain
 			if strength > 1 then
@@ -60,32 +66,17 @@ function onTick(tick_time)
 		end
 	end
 
-	n = RES_X * RES_Y
 	out = { float_values = {}, bool_values = {} }
-	if cells ~= nil then
-		-- raw mode: floats 1->n are the cell intensities; packed mode: the plugin returns ceil(n/2) floats, each = high*4096 + low (two 12-bit cells).
-		for i = 1, 32 do
-			if cells[i] ~= nil then
-				out.float_values[i] = cells[i]
-			end
-		end
-	end
-
-	-- Composite bool channels let a monitor/micro decode the format:
-	--   bool 1        target detect
-	--   bool 2->4     RES_X bits (LSB first)
-	--   bool 5->7     RES_Y bits (LSB first)
-	--   bool 8        cells are packed 2-per-float (12-bit each)
+	out.float_values[1] = seeker_id or 0
+	out.float_values[2] = az_err
+	out.float_values[3] = el_err
+	out.float_values[4] = strength
+	out.float_values[5] = flux or 0
+	out.float_values[6] = ambient or 0
+	out.float_values[7] = n_sources or 0
 	out.bool_values[1] = detect
-	out.bool_values[2] = RES_X % 2 >= 1
-	out.bool_values[3] = RES_X % 4 >= 2
-	out.bool_values[4] = RES_X % 8 >= 4
-	out.bool_values[5] = RES_Y % 2 >= 1
-	out.bool_values[6] = RES_Y % 4 >= 2
-	out.bool_values[7] = RES_Y % 8 >= 4
-	out.bool_values[8] = n > 32
 
-	component.setOutputLogicSlotComposite(NODE_ARRAY, out)
+	component.setOutputLogicSlotComposite(NODE_DATA, out)
 	component.setOutputLogicSlotFloat(NODE_STRENGTH, strength)
 	component.setOutputLogicSlotBool(NODE_DETECT, detect)
 end

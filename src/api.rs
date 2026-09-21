@@ -63,6 +63,64 @@ pub(crate) unsafe fn register_ir_table(context: usize) {
     register(context, &name_object as *const usize, pairs.as_ptr(), context + 0x28);
 }
 
+/// Register the `ir` table into the drawing (screen) Lua environment.
+///
+/// The same three calls as the component-mod registration. That matters: the
+/// game's registrar creates a fresh table and sets it under the name, so if
+/// this state turned out to be the same one the component registrar already
+/// served, a shorter table would silently replace `ir` and take `ir.scan` away
+/// from the seeker. An identical table makes that replacement a no-op.
+///
+/// `ir.scan` from a state with no component context is harmless rather than
+/// dangerous: lua_component_handle only accepts the two upvalue tags the game
+/// uses, so it yields 0 and the scan simply finds nothing.
+pub(crate) unsafe fn register_ir_screen_table(state: usize) {
+    if state == 0 {
+        return;
+    }
+    let alloc: unsafe extern "C" fn(*mut usize, u32) = game_fn(RVA_STRING_ALLOC);
+    let fill: unsafe extern "C" fn(usize, *const u8, u32) = game_fn(RVA_STRING_FILL);
+    let register: unsafe extern "C" fn(usize, *const usize, *const FnPair, usize) =
+        game_fn(RVA_REGISTER_TABLE);
+
+    let mut name_object: usize = 0;
+    alloc(&mut name_object, 3);
+    if name_object == 0 {
+        log_line("ir screen registration: name allocation failed");
+        return;
+    }
+    fill(name_object, b"ir\0".as_ptr(), 3);
+
+    let pairs = [
+        FnPair {
+            name: b"scan\0".as_ptr(),
+            func: ir_scan as *const () as usize,
+        },
+        FnPair {
+            name: b"frame\0".as_ptr(),
+            func: ir_frame as *const () as usize,
+        },
+        FnPair {
+            name: b"probe\0".as_ptr(),
+            func: ir_probe as *const () as usize,
+        },
+        FnPair {
+            name: std::ptr::null(),
+            func: 0,
+        },
+    ];
+
+    // The game's own initializers hand register_table a stack slot to receive
+    // the table, so a local is the safe destination here.
+    let mut destination: usize = 0;
+    register(
+        state,
+        &name_object as *const usize,
+        pairs.as_ptr(),
+        &mut destination as *mut usize as usize,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // injected Lua functions
 // ---------------------------------------------------------------------------
@@ -77,6 +135,71 @@ pub(crate) extern "C" fn ir_probe(lua: *mut c_void) -> i32 {
         lua_push_number(lua, temperature);
     }
     1
+}
+
+/// A seeker's last rendered image, for the drawing Lua environment.
+///
+/// Takes the seeker's id (its `ir.scan` return value, which the seeker
+/// publishes to the microcontroller over the array composite), so a vehicle -
+/// or a world - with several seekers draws exactly the one it is wired to.
+///
+/// Returns (cells, width, height), cells holding one 0..255 value per cell in
+/// row-major order. This exists because a logic composite is 32 floats: packed
+/// two cells per float that caps an image at 64 cells, so a 64x64 frame cannot
+/// reach a monitor that way. The drawing environment has no component context
+/// either, so it cannot run the scan itself - it reads what the seeker
+/// published instead.
+pub(crate) extern "C" fn ir_frame(lua: *mut c_void) -> i32 {
+    let lua = lua as usize;
+    unsafe {
+        // arg 1: which seeker's frame. 0 (or omitted) returns nothing, because
+        // a seeker's id is never 0 - the drawing script passes what it read from
+        // the composite, so it asks for its own seeker and no other.
+        let id = (lua_arg_number(lua, 1).unwrap_or(0.0) as i64)
+            .clamp(0, FRAME_ID_MAX as i64) as u32;
+        let (width, height, bytes) = {
+            let frames = LAST_FRAME
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match frames.get(&id) {
+                Some((width, height, bytes)) => (*width, *height, bytes.clone()),
+                None => (0, 0, Vec::new()),
+            }
+        };
+        lua_push_table(lua);
+        for (index, value) in bytes.iter().enumerate() {
+            lua_push_number(lua, *value as f64);
+            lua_rawseti(lua, index as i64 + 1);
+        }
+        lua_push_number(lua, width as f64);
+        lua_push_number(lua, height as f64);
+    }
+    3
+}
+
+/// A seeker's identity for the frame map: 24 bits derived from its component.
+///
+/// Live components have distinct pointers, so this is unique among the seekers
+/// actually running, without anyone having to number them - which is the point:
+/// a channel number is global to the whole game process, so two vehicles that
+/// both picked 1 would overwrite each other's image. It changes when a vehicle
+/// is respawned, which the drawing side simply re-reads.
+pub(crate) fn seeker_id(component: usize) -> u32 {
+    if component == 0 {
+        return 0;
+    }
+    // Mix the whole pointer down to 24 bits rather than truncating it, so two
+    // components that differ only in their high bits still separate, and the
+    // value does not read as a raw address. Deterministic for a given component.
+    let mut mixed = (component as u64) ^ 0x9e37_79b9_7f4a_7c15;
+    mixed = mixed.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    mixed ^= mixed >> 29;
+    let id = (mixed & FRAME_ID_MAX as u64) as u32;
+    if id == 0 {
+        1
+    } else {
+        id
+    }
 }
 
 // One heat source as seen by the IR sensor.
@@ -98,6 +221,13 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
         // arg 11: pack the image 2 cells per float (12-bit each) when the grid
         // is larger than one composite channel set (33..64 cells).
         let pack = lua_arg_number(lua, 11).unwrap_or(0.0) != 0.0;
+        // arg 12: whether to return the cell table. A seeker whose image reaches
+        // the microcontroller through ir.frame (rather than a composite) can skip
+        // it: at 64x64 that is 4096 Lua table insertions per scan for values
+        // nobody reads. An empty table is still returned, to keep the order of
+        // the other return values.
+        let cells_out = lua_arg_number(lua, 12).unwrap_or(1.0) != 0.0;
+
 
         let cell_count = (res_x * res_y) as usize;
         let mut cells = vec![0.0f64; cell_count];
@@ -128,13 +258,16 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
         let mut packed_vals: Vec<f64> = Vec::new();
 
         let component = lua_component(lua);
+        let seeker_id = seeker_id(component);
         #[allow(unused_assignments)]
         let mut origin = (0.0f64, 0.0f64, 0.0f64);
         // The scan runs whenever the component exists; without a temperature
         // evaluation yet (no engine/probe this session) heat sources and the
         // real ambient are unavailable, but fires/flares still are (fires
         // holder cached by the fire-render hook).
-        if component != 0 {
+        // A foreign Lua state can hand back a pointer that is not a component at
+        // all, so the vtable is checked before anything is read through it.
+        if component != 0 && crate::hooks::looks_like_component(component) {
             let matrix = read_component_matrix(component);
             origin = (matrix[12], matrix[13], matrix[14]);
             let (forward, up) = axes_for(axis, &matrix);
@@ -366,6 +499,25 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                 }
             }
 
+            // Publish the rendered frame for the drawing environment, under this
+            // seeker's identity. A logic composite is 32 floats - 64 packed
+            // cells - so a 64x64 image can only leave the component through the
+            // Lua state; ir.frame(id) reads this snapshot from the
+            // microcontroller side.
+            {
+                let bytes: Vec<u8> = cells
+                    .iter()
+                    .map(|value| (value.clamp(0.0, 1.0) * 255.0) as u8)
+                    .collect();
+                let mut frames = LAST_FRAME
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if frames.len() >= FRAME_MAP_MAX && !frames.contains_key(&seeker_id) {
+                    frames.clear();
+                }
+                frames.insert(seeker_id, (res_x, res_y, bytes));
+            }
+
             // Optional packing for grids above one composite channel set
             // (33..64 cells): 2 cells per float, 12 bits each — value =
             // high*4096 + low. Exact in an f32 composite channel; the receiving
@@ -577,15 +729,17 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
         }
 
         let _ = lua_push_table(lua);
-        if pack && !packed_vals.is_empty() {
-            for (index, value) in packed_vals.iter().enumerate() {
-                lua_push_number(lua, *value);
-                lua_rawseti(lua, index as i64 + 1);
-            }
-        } else {
-            for (index, value) in cells.iter().enumerate() {
-                lua_push_number(lua, *value);
-                lua_rawseti(lua, index as i64 + 1);
+        if cells_out {
+            if pack && !packed_vals.is_empty() {
+                for (index, value) in packed_vals.iter().enumerate() {
+                    lua_push_number(lua, *value);
+                    lua_rawseti(lua, index as i64 + 1);
+                }
+            } else {
+                for (index, value) in cells.iter().enumerate() {
+                    lua_push_number(lua, *value);
+                    lua_rawseti(lua, index as i64 + 1);
+                }
             }
         }
         lua_push_number(lua, az_error);
@@ -594,8 +748,9 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
         lua_push_number(lua, total_flux);
         lua_push_number(lua, base_temp);
         lua_push_number(lua, source_count as f64);
+        lua_push_number(lua, seeker_id as f64);
     }
-    7
+    8
 }
 
 // ---------------------------------------------------------------------------
