@@ -11,8 +11,6 @@ IR_GAIN = 0.01
 DETECT_FLUX = 0.001
 OCCLUSION = true
 FORWARD_AXIS = 2 -- 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
-SCAN_TILES = 1
-scan_tile = 0
 
 function onAddToSimulation()
 	plugin_error_reported = false
@@ -28,7 +26,6 @@ function onTick(tick_time)
 	dflux = DETECT_FLUX
 	rx = RES_X
 	ry = RES_Y
-	scan_tiles = SCAN_TILES
 	seeker_id = 0
 	occl = 1.0
 	if not OCCLUSION then
@@ -46,14 +43,11 @@ function onTick(tick_time)
 		if f[6] ~= nil and f[6] > 0 then dflux = f[6] end
 		if f[7] ~= nil and f[7] > 0 then rx = math.floor(f[7] + 0.5) end
 		if f[8] ~= nil and f[8] > 0 then ry = math.floor(f[8] + 0.5) end
-		if f[9] ~= nil and f[9] > 1 then scan_tiles = math.floor(f[9] + 0.5) end
 	end
 	if rx < 1 then rx = 1 end
 	if rx > 64 then rx = 64 end
 	if ry < 1 then ry = 1 end
 	if ry > 64 then ry = 64 end
-	if scan_tiles < 1 then scan_tiles = 1 end
-	if scan_tiles > 8 then scan_tiles = 8 end
 
 	cells = nil
 	az_err = 0.0
@@ -71,34 +65,22 @@ function onTick(tick_time)
 			end
 			detect = flux >= dflux
 		end
-		if scan_tiles > 1 then
-			sub = fov / scan_tiles
-			half = (scan_tiles - 1) * 0.5
-			ir.scan(az + (scan_tile % scan_tiles - half) * sub,
-				el + (math.floor(scan_tile / scan_tiles) - half) * sub,
-				sub, range, rx, ry, gain, dflux, FORWARD_AXIS, occl, false, false)
-		end
 	else
 		seeker_id = -1
 		strength = -1
 	end
 
 	out = { float_values = {}, bool_values = {} }
-	out.float_values[1] = seeker_id or 0
-	out.float_values[2] = az_err
-	out.float_values[3] = el_err
+	out.float_values[1] = az_err
+	out.float_values[2] = el_err
+	out.float_values[3] = seeker_id or 0
 	out.float_values[4] = strength
 	out.float_values[5] = flux or 0
 	out.float_values[6] = ambient or 0
 	out.float_values[7] = n_sources or 0
-	out.float_values[8] = scan_tile
-	out.float_values[9] = scan_tiles
 	out.bool_values[1] = detect
 
 	component.setOutputLogicSlotComposite(NODE_DATA, out)
-	if seeker_id > 0 and scan_tiles > 1 then
-		scan_tile = (scan_tile + 1) % (scan_tiles * scan_tiles)
-	end
 	component.setOutputLogicSlotFloat(NODE_STRENGTH, strength)
 	component.setOutputLogicSlotBool(NODE_DETECT, detect)
 

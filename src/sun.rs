@@ -88,6 +88,7 @@ pub(crate) unsafe fn add_sun_source(origin: Vec3, sources: &mut Vec<IrSource>) {
         el: 0.0,
         theta: (SUN_R_EFF / SUN_DIST).atan(),
         sky: true,
+        temp_c: 0.0,
     });
     SUN_LOG.store((percent * 1000.0).clamp(0.0, 1_000_000.0) as usize + 2, Ordering::Relaxed);
 }

@@ -21,6 +21,7 @@ pub(crate) struct IrSource {
     pub(crate) el: f64,
     pub(crate) theta: f64, // angular radius (rad)
     pub(crate) sky: bool,  // sky source (the sun): not range-culled
+    pub(crate) temp_c: f64, // emitter temperature (C), for attribution only
 }
 
 /// Planck spectral radiance integrated over 3..5 um (W/m^2/sr), 24-point

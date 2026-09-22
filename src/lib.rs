@@ -89,14 +89,19 @@ fn bootstrap() {
         dll_path.display()
     ));
 
-    // Liveness probe. The bootstrap log only advances when the game calls a
-    // hooked function, so a plugin that loaded but is never called looks
-    // identical to a plugin that died. This thread writes to its own file with
-    // no shared lock, so "plugin alive but never called" is now visible.
+    // Liveness probe. Verbose builds only: the player build stays silent, so
+    // the only log it writes is the bootstrap. The bootstrap log advances
+    // whenever the game calls a hooked function, so "loaded but never called"
+    // and "dead" stay distinguishable there.
+    #[cfg(feature = "logging")]
     {
         let dir = log_dir.clone();
         let _ = std::thread::spawn(move || {
             let path = dir.join("infrared_heartbeat.log");
+            // Re-initialise per injection so old sessions do not mix in - the
+            // per-beat writes below append by design, this only clears the
+            // file this session starts.
+            let _ = fs::write(&path, b"");
             let mut beat = 0u64;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(10));
@@ -108,10 +113,36 @@ fn bootstrap() {
                 let jet = crate::state::JET_TICK_CALLS.load(Ordering::Relaxed);
                 let rocket = crate::state::ROCKET_TICK_CALLS.load(Ordering::Relaxed);
                 let screen = crate::state::SCREEN_INIT_HITS.load(Ordering::Relaxed);
+                let fire_i = f32::from_bits(
+                    crate::state::FIRE_INTENSITY_MAX_BITS.load(Ordering::Relaxed),
+                );
+                let fire_only = f32::from_bits(
+                    crate::state::FIRE_ONLY_MAX_BITS.load(Ordering::Relaxed),
+                );
+                let smoke_only = f32::from_bits(
+                    crate::state::SMOKE_ONLY_MAX_BITS.load(Ordering::Relaxed),
+                );
                 let samples = crate::state::ENGINE_SAMPLES
                     .lock()
                     .map(|s| s.len())
                     .unwrap_or(0);
+                // In-cone sources from the last scan. Player-build diagnostics:
+                // distance, effective radius and flux identify an emitter and
+                // let its temperature be back-solved offline.
+                let sources = crate::state::LAST_SOURCES
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
+                // Per-jet-part raw fields: power/heat/exhaust are the three
+                // candidates for what a jet's IR should actually be driven by.
+                let mut jets = crate::state::JET_PARTS
+                    .lock()
+                    .map(|j| j.clone())
+                    .unwrap_or_default();
+                // Entries from despawned components have a stamp that stopped
+                // advancing; their tick is gone, so drop them here.
+                let now = crate::state::now_ms();
+                jets.retain(|entry| now.saturating_sub(entry.10) < crate::state::EMITTER_STALE_MS);
                 if let Ok(mut file) = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -120,9 +151,40 @@ fn bootstrap() {
                     let _ = writeln!(
                         file,
                         "heartbeat {beat}: hooks={} calls custom={custom} preset={preset} fluid={fluid} \
-steam={steam} jet={jet} rocket={rocket} screen={screen} samples={samples}",
-                        crate::state::HOOKS_INSTALLED.load(Ordering::Relaxed) as u8
+steam={steam} jet={jet} rocket={rocket} screen={screen} samples={samples} \
+fire_i={fire_i:.6} fire_only={fire_only:.6} smoke_only={smoke_only:.6} srcs={} jets={}",
+                        crate::state::HOOKS_INSTALLED.load(Ordering::Relaxed) as u8,
+                        sources.len(),
+                        jets.len()
                     );
+                    for (
+                        _comp,
+                        def,
+                        part,
+                        ab,
+                        power,
+                        heat,
+                        exhaust,
+                        d0,
+                        size_m,
+                        ir_temp,
+                        _seen,
+                    ) in jets.iter()
+                    {
+                        let _ = writeln!(
+                            file,
+                            "  jet def={def:#x} type={part} ab={ab} rps={power:.2} f1d8={heat:.5} \
+f1cc={exhaust:.5} f1d0={d0:.5} size={size_m:.2} m -> ir_temp={ir_temp:.1} C"
+                        );
+                    }
+                    for (i, (dist, r_eff, flux, sky, temp_c)) in sources.iter().enumerate() {
+                        let _ = writeln!(
+                            file,
+                            "  src[{i}]{}: dist={dist:.1} m r_eff={r_eff:.3} m flux={flux:.6e} \
+temp={temp_c:.1} C",
+                            if *sky { " SKY" } else { "" }
+                        );
+                    }
                 }
             }
         });

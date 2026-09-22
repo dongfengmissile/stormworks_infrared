@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::Mutex;
 
 
@@ -14,6 +14,18 @@ pub(crate) static ORIG_REGISTRAR: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static ORIG_TEMPERATURE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static ORIG_FIRES_BUILD: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static FIRES_HOLDER: AtomicUsize = AtomicUsize::new(0);
+/// Largest fire intensity seen this session (the float at group+0x94), as f32
+/// bits, reported in the heartbeat. The game scales a 5 m linear falloff by
+/// this value; the plugin's radiometry treats it as a multiplier on a fixed
+/// 1 m 1000 C emitter, so its real range decides whether that model is wrong
+/// by a constant factor or is simply reading a small per-fire value.
+pub(crate) static FIRE_INTENSITY_MAX_BITS: AtomicU32 = AtomicU32::new(0);
+/// Largest intensity among entries whose +0x91 flag marks a real fire
+/// (param_5 == 0 in FUN_140300110, scaled by 400) as opposed to smoke
+/// (non-zero, scaled by 50). The plugin currently models every ring entry as a
+/// fire, so these two maxima show whether the ring it reads is fires or smoke.
+pub(crate) static FIRE_ONLY_MAX_BITS: AtomicU32 = AtomicU32::new(0);
+pub(crate) static SMOKE_ONLY_MAX_BITS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static ORIG_SCENE_TICK: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static SCENE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static HOOKS_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -91,11 +103,45 @@ pub(crate) static ROCKET_TICK_CALLS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static JET_MAX_POWER_BITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static JET_MAX_HEAT_BITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ROCKET_MAX_POWER_BITS: AtomicU64 = AtomicU64::new(0);
-// (emitter, x, y, z, volume, temperature) - one live record per emitter, so a
-// per-tick update just refreshes its entry instead of growing the list.
-/// Pending engine/plume sources: (key, x, y, z, activity, temperature, size m).
-pub(crate) static EMITTER_PENDING: Mutex<Vec<(usize, f64, f64, f64, f64, f64, f64)>> =
+/// Pending engine/plume sources: (key, last-seen ms, x, y, z, activity,
+/// temperature, size m). A despawned component never ticks again, so its entry
+/// would radiate forever as a phantom; readers drop anything older than
+/// EMITTER_STALE_MS rather than trusting the hooks to retract it.
+pub(crate) static EMITTER_PENDING: Mutex<Vec<(usize, u64, f64, f64, f64, f64, f64, f64)>> =
     Mutex::new(Vec::new());
+
+/// Entries older than this are dropped as phantoms of despawned components.
+/// Anything alive refreshes its entry every tick, so 2 s is generous.
+pub(crate) const EMITTER_STALE_MS: u64 = 2000;
+
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Milliseconds since the plugin loaded - the freshness stamp for state that
+/// only a live component's tick can refresh.
+pub(crate) fn now_ms() -> u64 {
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// In-cone sources from the most recent scan as (distance m, effective radius
+/// m, flux, sky), bounded so the heartbeat line stays small. Exists so a faint
+/// reading can be attributed to a specific emitter from the player build - the
+/// verbose build is unusable while it has an unexplained crash.
+pub(crate) static LAST_SOURCES: Mutex<Vec<(f64, f64, f64, bool, f64)>> = Mutex::new(Vec::new());
+
+/// One entry per jet part INSTANCE, keyed by component pointer so two copies
+/// of the same part definition (a twin engine's two exhausts) each get a line.
+/// (component, definition pointer, part type from definition+0xed4, afterburner
+/// lit, RPS at +0x1bc, field at +0x1d8, field at +0x1cc, field at +0x1d0,
+/// block size m, published IR temp C, last-seen ms).
+/// A jet multiblock ticks once per part, so this also exposes the turbine count
+/// that a jet's signature is supposed to scale with. Bounded, and read by the
+/// player-build heartbeat because the verbose build is unusable while it
+/// crashes.
+pub(crate) static JET_PARTS:
+    Mutex<Vec<(usize, usize, u32, u32, f64, f64, f64, f64, f64, f64, u64)>> = Mutex::new(Vec::new());
 
 // Arguments seen by FUN_14030fd60. p2 is the (global) heat-source container and
 // p9 is the owner filter the game compares under equality to record+0x120, so

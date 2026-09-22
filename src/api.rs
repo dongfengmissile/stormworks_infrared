@@ -390,6 +390,25 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                 inside
             });
 
+            // Snapshot the survivors for the heartbeat: distance, effective
+            // radius and flux are enough to identify an emitter and back-solve
+            // its temperature, which is exactly what a faint reading needs.
+            if let Ok(mut snapshot) = LAST_SOURCES.lock() {
+                snapshot.clear();
+                for s in sources.iter().take(8) {
+                    let dx = s.x - origin.0;
+                    let dy = s.y - origin.1;
+                    let dz = s.z - origin.2;
+                    snapshot.push((
+                        (dx * dx + dy * dy + dz * dz).sqrt(),
+                        s.r_eff,
+                        s.flux,
+                        s.sky,
+                        s.temp_c,
+                    ));
+                }
+            }
+
             // Cued acquisition: with an empty cone, report the direction to
             // the brightest source inside the forward hemisphere (~80 deg) as
             // the az/el error so the operator or a guidance loop can slew onto
@@ -426,6 +445,14 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                 } else {
                     cell_solid / solid
                 };
+                // How far past full scale this source's core would clip, which
+                // is the light available to bloom into the surrounding cells.
+                let excess = if gain > 1e-9 {
+                    (s.flux * dilut / gain - 1.0).max(0.0)
+                } else {
+                    0.0
+                };
+                let glare = BLOOM_PEAK * (1.0 - (-excess).exp());
                 for row in 0..res_y {
                     for col in 0..res_x {
                         let dc = col_f - col as f64;
@@ -439,11 +466,11 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                             let ang = (a * a + b * b).sqrt();
                             ((s.theta - ang) / (0.3 * s.theta)).clamp(0.0, 1.0)
                         };
-                        if w <= 0.0 {
-                            continue;
-                        }
                         let idx = (row * res_x + col) as usize;
-                        let nv = s.flux * dilut * w;
+                        let halo = glare
+                            * (-(d_cells / BLOOM_RADIUS_CELLS).powi(2)).exp()
+                            * gain;
+                        let nv = (s.flux * dilut * w).max(halo);
                         if nv > cells[idx] {
                             cells[idx] = nv;
                         }

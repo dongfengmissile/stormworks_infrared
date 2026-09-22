@@ -14,7 +14,7 @@ function onTick()
 		cells = nil
 		return
 	end
-	seeker_id = input.getNumber(1)
+	seeker_id = input.getNumber(3)
 	if seeker_id == nil then
 		seeker_id = 0
 	end

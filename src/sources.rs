@@ -8,6 +8,7 @@ use crate::ir::{
 use crate::memory::{read_f32_at, read_f64_at, read_u32_at, read_usize_at};
 use crate::offsets::*;
 use crate::state::*;
+use std::sync::atomic::Ordering;
 
 /// Read an ASCII string stored as {ptr @+0, len u32 @+8} at `base`.
 pub(crate) unsafe fn read_pstr(base: usize, max: usize) -> Option<Vec<u8>> {
@@ -119,6 +120,7 @@ pub(crate) unsafe fn collect_ir_sources(
             el: 0.0,
             theta: (r_eff / dist.max(0.5)).atan(),
             sky: false,
+            temp_c: temp,
         });
     }
 }
@@ -126,8 +128,12 @@ pub(crate) unsafe fn collect_ir_sources(
 /// Fires (burning objects) as IR emitters. Container layout is what
 /// FUN_14030fd60 reads as param_5: ring slots +0x11d8, cap +0x11e0, start
 /// +0x11e4, count +0x11e8; each group holds a world position at +0x38..+0x48
-/// and an intensity float at +0x94. Treated as a ~1 m ~1000 C emitter scaled
-/// by its intensity.
+/// an intensity float at +0x94 and a fire/smoke flag at +0x91. The group is
+/// allocated as exactly 0x98 bytes (FUN_1403025e0), so +0x94 is its last
+/// field, and FUN_140300110 clamps that intensity to 0..1 - it is a normalised
+/// fire strength, not a radiance. Treated here as a FIRE_T_K emitter whose
+/// radius is FIRE_RADIUS_PER_INTENSITY x intensity, matching the game's own
+/// particle geometry (see those constants).
 pub(crate) unsafe fn collect_fire_sources(
     c: usize,
     origin: &Vec3,
@@ -159,27 +165,39 @@ pub(crate) unsafe fn collect_fire_sources(
         if !(x != 0.0 || y != 0.0 || z != 0.0) || intensity <= 0.0 {
             continue;
         }
+        // Positive floats compare consistently as raw bits, so fetch_max on
+        // the bit pattern tracks the largest intensity. +0x91 == 0 is a fire;
+        // anything else is smoke, which this model treats as a fire.
+        let bits = (intensity as f32).to_bits();
+        FIRE_INTENSITY_MAX_BITS.fetch_max(bits, Ordering::Relaxed);
+        if read_u32_at(group + 0x91) & 0xff == 0 {
+            FIRE_ONLY_MAX_BITS.fetch_max(bits, Ordering::Relaxed);
+        } else {
+            SMOKE_ONLY_MAX_BITS.fetch_max(bits, Ordering::Relaxed);
+        }
         let dx = x - origin.0;
         let dy = y - origin.1;
         let dz = z - origin.2;
         let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-        let surface = (dist - 1.0).max(1.0);
+        let r_eff = FIRE_RADIUS_PER_INTENSITY * intensity;
+        let surface = (dist - r_eff).max(1.0);
         if surface > range {
             continue;
         }
-        let flux = intensity * band_radiance(FIRE_T_K) / (surface * surface)
+        let flux = intensity * band_radiance(FIRE_T_K) * (r_eff * r_eff) / (surface * surface)
             / mwir_ref()
             * weather_transmittance(wx_fog, wx_rain, surface, false);
         out.push(IrSource {
             x,
             y,
             z,
-            r_eff: 1.0,
+            r_eff,
             flux,
             az: 0.0,
             el: 0.0,
-            theta: (1.0 / dist.max(0.5)).atan(),
+            theta: (r_eff / dist.max(0.5)).atan(),
             sky: false,
+            temp_c: (FIRE_T_K - 273.15),
         });
     }
 }
@@ -257,6 +275,7 @@ pub(crate) unsafe fn collect_volume_heat_sources(
             el: 0.0,
             theta: (r_eff / dist.max(0.5)).atan(),
             sky: false,
+            temp_c: heat,
         });
     }
 }
@@ -266,15 +285,26 @@ pub(crate) unsafe fn collect_volume_heat_sources(
 /// position and a throttle-scaled emission rate each tick, so the spectrum
 /// follows throttle without touching game state.
 pub(crate) unsafe fn collect_emitter_sources(origin: &Vec3, range: f64, out: &mut Vec<IrSource>) {
-    let pending = match EMITTER_PENDING.lock() {
+    let mut pending = match EMITTER_PENDING.lock() {
         Ok(mut p) => std::mem::take(&mut *p),
         Err(_) => return,
     };
+    // A despawned component never ticks again, so its entry would radiate
+    // forever from the last position it reported. Age entries out here - this
+    // is the only reader that runs even when every hooked component is gone.
+    let now = now_ms();
+    pending.retain(|entry| now.saturating_sub(entry.1) < EMITTER_STALE_MS);
     if pending.is_empty() {
         return;
     }
     let (wx_fog, wx_rain) = weather_fog_rain();
-    for (_emitter, x, y, z, size, temp, block_m) in pending {
+    // Only collapse repeats of *this* collector's own emitters. Comparing
+    // against the whole accumulated list let a heat record (collected just
+    // before this, at the same position as the engine) suppress the engine's
+    // own emitter as a "duplicate", silently hiding every engine that also has
+    // a heat record - which is precisely the case this plugin exists to image.
+    let first_new = out.len();
+    for (_emitter, _seen, x, y, z, size, temp, block_m) in pending {
         let dx = x - origin.0;
         let dy = y - origin.1;
         let dz = z - origin.2;
@@ -287,20 +317,10 @@ pub(crate) unsafe fn collect_emitter_sources(origin: &Vec3, range: f64, out: &mu
         if surface > range {
             continue;
         }
-        // One emitter can spawn a fresh instance every frame; collapse repeats.
-        let dup = out.iter().any(|s| {
-            let ddx = s.x - x;
-            let ddy = s.y - y;
-            let ddz = s.z - z;
-            ddx * ddx + ddy * ddy + ddz * ddz < 4.0
-        });
-        if dup {
-            continue;
-        }
         let flux = band_radiance(temp + 273.15) * (r_eff * r_eff) / (surface * surface)
             / mwir_ref()
             * weather_transmittance(wx_fog, wx_rain, surface, false);
-        out.push(IrSource {
+        let cand = IrSource {
             x,
             y,
             z,
@@ -310,6 +330,26 @@ pub(crate) unsafe fn collect_emitter_sources(origin: &Vec3, range: f64, out: &mu
             el: 0.0,
             theta: (r_eff / dist.max(0.5)).atan(),
             sky: false,
+            temp_c: temp,
+        };
+        // One emitter can spawn a fresh instance every frame; collapse repeats
+        // onto the HOTTEST member of each 2 m cluster, not the first one pushed,
+        // so a multiblock always reads as its combustion chamber rather than
+        // whichever part happened to tick first.
+        let hit = out[first_new..].iter().position(|s| {
+            let ddx = s.x - x;
+            let ddy = s.y - y;
+            let ddz = s.z - z;
+            ddx * ddx + ddy * ddy + ddz * ddz < 4.0
         });
+        match hit {
+            Some(i) => {
+                let slot = &mut out[first_new + i];
+                if cand.temp_c > slot.temp_c {
+                    *slot = cand;
+                }
+            }
+            None => out.push(cand),
+        }
     }
 }

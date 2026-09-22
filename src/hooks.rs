@@ -139,10 +139,20 @@ extern "C" fn ir_exhaust_update_hook(
                         if x != 0.0 || y != 0.0 || z != 0.0 {
                             if let Ok(mut pending) = EMITTER_PENDING.lock() {
                                 if let Some(entry) = pending.iter_mut().find(|e| e.0 == emitter) {
-                                    *entry = (emitter, x, y, z, rate, temp, ENGINE_DEFAULT_SIZE_M);
+                                    *entry = (
+                                        emitter,
+                                        now_ms(),
+                                        x,
+                                        y,
+                                        z,
+                                        rate,
+                                        temp,
+                                        ENGINE_DEFAULT_SIZE_M,
+                                    );
                                 } else if pending.len() < EMITTER_MAX_PENDING {
                                     pending.push((
                                         emitter,
+                                        now_ms(),
                                         x,
                                         y,
                                         z,
@@ -281,6 +291,12 @@ unsafe fn definition_name(definition: usize) -> String {
     // inline runs as well as following pointers.
     let mut run = Vec::new();
     for offset in 0..0x300 {
+        // Re-verify each chunk: the 0x200-byte check above does not cover this
+        // whole 0x300-byte scan, and one dereference past an unmapped page
+        // takes the game down with it.
+        if offset % 64 == 0 && !readable(definition + offset, 64) {
+            break;
+        }
         let byte = *((definition + offset) as *const u8);
         if (0x20..0x7f).contains(&byte) {
             run.push(byte);
@@ -434,12 +450,18 @@ unsafe fn dump_class_fields(
     let mut seen: Vec<usize> = Vec::new();
     let mut printed = 0usize;
     for sample in samples.iter().filter(|sample| families.contains(&sample.family)) {
+        // A sample key can outlive its component (despawn), so the
+        // readability guard must come before ANY dereference. The previous
+        // order read key+0x58 first, which faults on a freed component.
+        if !readable(sample.key, 0x40) {
+            continue;
+        }
         let definition = read_usize_at(sample.key + 0x58);
         if seen.contains(&definition) {
             continue;
         }
         seen.push(definition);
-        if printed >= 20 || !readable(sample.key, 0x40) {
+        if printed >= 20 {
             continue;
         }
         printed += 1;
@@ -462,6 +484,11 @@ unsafe fn float_window(component: usize, base: usize, count: usize) -> String {
     let mut out = String::new();
     for index in 0..count {
         let offset = base + index * 4;
+        // Callers verify only the component header, so every read re-verifies
+        // its own few bytes rather than trusting the caller's range.
+        if !readable(component + offset, 4) {
+            continue;
+        }
         let value = read_f32_at(component + offset);
         if value != 0.0 && value.is_finite() && value.abs() > 1e-9 {
             out.push_str(&format!(" {offset:x}:{value:.4}"));
@@ -492,10 +519,11 @@ unsafe fn publish_engine_source(
         return;
     }
     if let Ok(mut pending) = EMITTER_PENDING.lock() {
+        let seen = now_ms();
         if let Some(entry) = pending.iter_mut().find(|entry| entry.0 == key) {
-            *entry = (key, x, y, z, power, temperature, size_m);
+            *entry = (key, seen, x, y, z, power, temperature, size_m);
         } else if pending.len() < EMITTER_MAX_PENDING {
-            pending.push((key, x, y, z, power, temperature, size_m));
+            pending.push((key, seen, x, y, z, power, temperature, size_m));
         }
     }
 }
@@ -528,6 +556,30 @@ fn note_rejection(message: &str) {
 
 #[cfg(not(feature = "logging"))]
 fn note_rejection(_message: &str) {}
+
+/// Bounded, definition-deduplicated gate for the per-call component probes.
+///
+/// These were gated on the per-component call count returned by
+/// `record_engine_sample`, which holds at most 32 entries: once the table was
+/// full, every further component reported "call 1" forever, so the probes
+/// logged on every tick - 17 MB in a few minutes, and past 100 MB in a long
+/// session, which crashed the game. A probe now fires once per part
+/// definition and at most PROBE_DEFS times overall, which is what these probes
+/// are actually for: identifying part types, not counting calls.
+#[cfg(feature = "logging")]
+unsafe fn probe_once(component: usize) -> bool {
+    const PROBE_DEFS: usize = 24;
+    static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    let definition = read_usize_at(component + 0x58);
+    let Ok(mut seen) = SEEN.lock() else {
+        return false;
+    };
+    if seen.contains(&definition) || seen.len() >= PROBE_DEFS {
+        return false;
+    }
+    seen.push(definition);
+    true
+}
 
 /// A component pointer is only trusted when its vtable points into the image;
 /// some call sites pass something else entirely (they showed up as vt=0x0
@@ -583,21 +635,19 @@ unsafe fn class_tick_probe(
     let size_m = component_size_m(component);
     calls.fetch_add(1, Ordering::Relaxed);
     #[cfg(feature = "logging")]
-    let n = record_engine_sample(component, family, 0.0, 0.0, position, size_m);
+    let _ = record_engine_sample(component, family, 0.0, 0.0, position, size_m);
     #[cfg(not(feature = "logging"))]
     let _ = record_engine_sample(component, family, 0.0, 0.0, position, size_m);
+    // The per-definition field dump lives in dump_class_fields (deduplicated
+    // and periodic); printing it here too made each first tick ~2 KB.
     #[cfg(feature = "logging")]
-    if n <= 2 {
+    if probe_once(component) {
         let definition = read_usize_at(component + 0x58);
         log_line(&format!(
-            "{family} tick[{component:#x} #{n}] vt={:#x} def={definition:#x} name={} size={size_m:.2}m \
+            "{family} tick[{component:#x}] vt={:#x} def={definition:#x} name={} size={size_m:.2}m \
 pos={position:?} matrix={matrix:#x} origin={origin:#x}",
             read_usize_at(component),
             definition_name(definition),
-        ));
-        log_line(&format!(
-            "{family} scalars[{component:#x}]{}",
-            scalar_fields(component, 60),
         ));
     }
 }
@@ -840,16 +890,15 @@ extern "C" fn ir_rocket_tick_hook(
             };
             ROCKET_TICK_CALLS.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "logging")]
-            let rocket_calls =
-                record_engine_sample(component, "rocket", power, 0.0, position, size_m);
+            let _ = record_engine_sample(component, "rocket", power, 0.0, position, size_m);
             #[cfg(not(feature = "logging"))]
             let _ = record_engine_sample(component, "rocket", power, 0.0, position, size_m);
             #[cfg(feature = "logging")]
-            if rocket_calls <= 3 {
+            if probe_once(component) {
                 let definition = read_usize_at(component + 0x58);
                 let subtype = read_u32_at(definition + 0xed4);
                 log_line(&format!(
-                    "rocket probe[{component:#x} #{rocket_calls}] power={raw_power:.4} burning={} \
+                    "rocket probe[{component:#x}] power={raw_power:.4} burning={} \
 def={definition:#x} sub={subtype} flags={} pos={position:?}",
                     burning as u8,
                     read_u32_at(component + 0x8),
@@ -940,10 +989,18 @@ extern "C" fn ir_jet_tick_hook(
 ) {
     unsafe {
         if readable(component, 0x1dc) && looks_like_component(component) {
-            let power = read_f32_at(component + 0x1bc) as f64;
-            #[cfg(feature = "logging")]
+            // +0x1bc is the spool speed: every turbine adds to it and the
+            // extracted power is proportional to it.
+            let power = read_f32_at(component + JET_RPS_OFFSET) as f64;
             let exhaust_c = read_f32_at(component + 0x1cc) as f64;
             let heat = read_f32_at(component + 0x1d8) as f64;
+            let field_d0 = read_f32_at(component + 0x1d0) as f64;
+            let definition = read_usize_at(component + 0x58);
+            let part_type = if definition >= 0x10000 {
+                read_u32_at(definition + DEF_JET_PART_TYPE) & 0xff
+            } else {
+                0
+            };
             let position = component_world_position(component, matrix, origin);
             JET_TICK_CALLS.fetch_add(1, Ordering::Relaxed);
             let size_m = component_size_m(component);
@@ -975,20 +1032,77 @@ extern "C" fn ir_jet_tick_hook(
                     ));
                 }
             }
-            // The 0..1 heat drives the block's own fire effect; fall back to the
-            // smoothed power when it is quiet.
-            let activity = if heat > ENGINE_MIN_POWER {
-                heat.clamp(0.0, 1.0)
+            // The game has no Celsius gas temperature anywhere: +0x1cc/+0x1d0
+            // are enthalpy (fuel * RPS) in two scales, which is how a compressor
+            // could read 2382 C at high spool. So the gas path is synthesised
+            // per part role. Below JET_RPS_TYPICAL the whole engine scales down
+            // toward ambient rather than sitting at running temperatures.
+            let ab_on = part_type == JET_EXHAUST_PART_TYPE
+                && (read_u32_at(component + JET_AFTERBURNER_OFFSET) & 0xff) != 0;
+            let is_exhaust = part_type == JET_EXHAUST_PART_TYPE;
+            // The exhaust part never accumulates spool, so its operating point
+            // comes from its 0..1 flow field instead of its own RPS.
+            let eff_rps = if is_exhaust {
+                heat.clamp(0.0, JET_EXHAUST_FLOW_FULL) / JET_EXHAUST_FLOW_FULL * JET_RPS_FULL
             } else {
-                (power * 0.5).clamp(0.0, 1.0)
+                power
             };
-            publish_engine_source(
-                component,
-                position,
-                activity,
-                JET_T_MIN_C + (JET_T_MAX_C - JET_T_MIN_C) * activity,
-                size_m,
-            );
+            let running = if is_exhaust {
+                eff_rps > JET_RPS_TYPICAL * 0.01
+            } else {
+                power > ENGINE_MIN_POWER
+            };
+            let (t_low, t_high) = if is_exhaust {
+                if ab_on {
+                    (JET_AB_T_LOW, JET_AB_T_HIGH)
+                } else {
+                    (JET_EXHAUST_T_LOW, JET_EXHAUST_T_HIGH)
+                }
+            } else if part_type == 2 || part_type == 3 {
+                (JET_CASING_T_LOW, JET_CASING_T_HIGH)
+            } else {
+                (JET_COMPRESSOR_T_C, JET_COMPRESSOR_T_C)
+            };
+            let ir_temp_c = if !running {
+                0.0
+            } else if eff_rps < JET_RPS_TYPICAL {
+                t_low * (eff_rps / JET_RPS_TYPICAL)
+            } else {
+                let blend =
+                    ((eff_rps - JET_RPS_TYPICAL) / (JET_RPS_FULL - JET_RPS_TYPICAL)).clamp(0.0, 1.0);
+                t_low + (t_high - t_low) * blend
+            };
+            let activity = if is_exhaust {
+                (heat / JET_EXHAUST_FLOW_FULL).clamp(0.0, 1.0)
+            } else {
+                (power / JET_RPS_FULL).clamp(0.0, 1.0)
+            };
+            if let Ok(mut parts) = JET_PARTS.lock() {
+                // A despawned part never ticks again, so its stamp stopped
+                // advancing; drop it here and the heartbeat stops listing jets
+                // that no longer exist.
+                let seen = now_ms();
+                parts.retain(|e| seen.saturating_sub(e.10) < EMITTER_STALE_MS);
+                let entry = (
+                    component,
+                    definition,
+                    part_type,
+                    if ab_on { 1u32 } else { 0 },
+                    power,
+                    heat,
+                    exhaust_c,
+                    field_d0,
+                    size_m,
+                    ir_temp_c,
+                    seen,
+                );
+                if let Some(slot) = parts.iter_mut().find(|e| e.0 == component) {
+                    *slot = entry;
+                } else if parts.len() < 48 {
+                    parts.push(entry);
+                }
+            }
+            publish_engine_source(component, position, activity, ir_temp_c, size_m);
         }
         let original = ORIG_JET_TICK.load(Ordering::SeqCst);
         if original == 0 {

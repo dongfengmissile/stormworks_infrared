@@ -147,8 +147,55 @@ pub(crate) const ENGINE_DEFAULT_SIZE_M: f64 = 0.75;
 pub(crate) const ROCKET_DRAIN_ACTIVITY: f64 = 0.6;
 pub(crate) const ROCKET_T_MIN_C: f64 = 200.0;
 pub(crate) const ROCKET_T_MAX_C: f64 = 900.0;
-pub(crate) const JET_T_MIN_C: f64 = 150.0;
-pub(crate) const JET_T_MAX_C: f64 = 900.0;
+/// Compressor section: compression heating only, roughly flat with spool.
+pub(crate) const JET_COMPRESSOR_T_C: f64 = 200.0;
+/// Combustion chamber and turbine radiate as cooled CASING, not as the gas
+/// inside - that gas never reaches the outside world. The open exhaust does,
+/// which is why it owns the strongest signature.
+pub(crate) const JET_CASING_T_LOW: f64 = 300.0;
+pub(crate) const JET_CASING_T_HIGH: f64 = 500.0;
+/// Open exhaust nozzle: the hot gas leaving the engine.
+pub(crate) const JET_EXHAUST_T_LOW: f64 = 500.0;
+pub(crate) const JET_EXHAUST_T_HIGH: f64 = 900.0;
+/// The same exhaust with the afterburner lit.
+pub(crate) const JET_AB_T_LOW: f64 = 1400.0;
+pub(crate) const JET_AB_T_HIGH: f64 = 1900.0;
+/// The exhaust part's 0..1 flow field at +0x1d8 tracks the engine's operating
+/// point (0.06 idling, ~1.0 at full spool) because the exhaust never
+/// accumulates spool of its own - case 4 of the tick does not touch +0x1bc.
+pub(crate) const JET_EXHAUST_FLOW_FULL: f64 = 1.0;
+/// Afterburner toggle on the exhaust part: in case 4 of the jet tick this bool
+/// gates a thrust multiplier of (fuel/0.001)*0.5 + 1, up to 1.5x - the
+/// "moderate increase in thrust" of a lit afterburner.
+pub(crate) const JET_AFTERBURNER_OFFSET: usize = 0x240;
+/// jet_engine_component_type of an exhaust nozzle.
+pub(crate) const JET_EXHAUST_PART_TYPE: u32 = 4;
+/// Glare (sensor bloom). A core bright enough to clip at the gain stage
+/// scatters a fraction of that light across the array, so a saturating source
+/// dominates the frame instead of clipping into one bright dot. The halo peaks
+/// at BLOOM_PEAK (of full scale) however bright the source, and falls off as a
+/// gaussian over BLOOM_RADIUS_CELLS.
+pub(crate) const BLOOM_PEAK: f64 = 0.6;
+pub(crate) const BLOOM_RADIUS_CELLS: f64 = 3.0;
+/// Jet part type, read from the part definition. The jet tick switches on
+/// *(definition + 0xed4): 0/1 = intake/compressor stage, 2 = combustion
+/// chamber (adds fuel * 1600 to the part temperature), 3 = turbine (extracts
+/// power from the part temperature and halves it), 4 = exhaust nozzle (spawns
+/// the plume once the part temperature passes 1000 C).
+pub(crate) const DEF_JET_PART_TYPE: usize = 0xed4;
+/// Jet spool speed, in RPS. Case 3 (the turbine) does
+/// `+0x1bc += (+0x1cc * 0.5) * 7.5e-05`, so every turbine adds to it, and case 2
+/// treats 200.0 as an over-speed event - this single field therefore already
+/// carries both "how many turbines" and "how fast", the two things a jet's
+/// signature is supposed to scale with.
+pub(crate) const JET_RPS_OFFSET: usize = 0x1bc;
+/// The spool speed jets are actually flown at - around 10 RPS to save fuel,
+/// with parallel turbines making up the thrust. The per-role temperatures are
+/// anchored here and rise to their full-spool values at JET_RPS_FULL.
+pub(crate) const JET_RPS_TYPICAL: f64 = 10.0;
+/// Spool speed treated as full power. Jets destroy themselves somewhere past
+/// 100 RPS, so 100 is the natural "full" reference. Single tunable.
+pub(crate) const JET_RPS_FULL: f64 = 100.0;
 pub(crate) const RVA_EXHAUST_UPDATE: usize = 0x0030_2bb0; // FUN_140302bb0(emitter, world_pos, ..., rate, ...)
 pub(crate) const EXHAUST_UPDATE_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x18, 0x4c, 0x89, 0x48, 0x20, 0x55, 0x56, 0x57, 0x41, 0x54,
@@ -212,9 +259,34 @@ pub(crate) const TAU: f64 = std::f64::consts::TAU;
 /// engine radiates almost nothing in-band, so hot sources get their realistic
 /// ~356x brightness over a warm engine instead of a tame (T/400 K)^4 scaling.
 /// flux = factor * L_band(T_K) * r^2 / d^2 / MWIR_REF, with MWIR_REF calibrated
-/// so a 40 C / r=0.7 record at 10 m reads ~0.29 (the old model's anchor).
-pub(crate) const MWIR_ANCHOR_FLUX: f64 = 0.29;
-pub(crate) const FIRE_T_K: f64 = 1273.15; // ~1000 C flame, scaled by the fire's intensity
+/// off a 40 C / r=0.7 record at 10 m. That record actually reads ~1.16x
+/// MWIR_ANCHOR_FLUX because the near-field clamp makes its surface distance
+/// 9.3 m rather than 10 m.
+///
+/// Absolute scale is arbitrary (every consumer divides by the seeker's IR gain,
+/// which is a free parameter), but it is not cosmetic: the Strength readout is
+/// flux/gain clamped to 1 and Target Detect is flux >= detect_flux, so a scale
+/// that puts ordinary sources near 1e-4 forces both into silly territory - the
+/// reported symptom was needing gain 1e-5 to see anything, which pins Strength
+/// at 1 and forces a detect threshold of ~1e-5. Raised 1000x from the original
+/// 0.29 so an ordinary source reads around 1 and gain ~1 works. This is the one
+/// number to tune if the whole world is too bright or too dim.
+pub(crate) const MWIR_ANCHOR_FLUX: f64 = 290.0;
+/// Flame temperature for the fire-group class. Flares live in the *same*
+/// ring as ordinary fires (the world fire-group ring at holder+0x11d8, see
+/// collect_fire_sources) and carry no separate heat signature, so a single
+/// temperature has to serve both and the game's own 400 brightness scale
+/// cannot be used - it would drag flares down with the wood fires. 1500 C is
+/// the low end of a flare's 1500-2000 C burn and a reasonable upper bound for
+/// a structure fire, so it errs bright for fires and correct for flares.
+pub(crate) const FIRE_T_K: f64 = 1773.15; // ~1500 C flame/flare
+
+/// Flame radius in metres per unit of the fire's 0..1 intensity. The game
+/// sizes a fire by that intensity: FUN_140300110 sets each particle's scale to
+/// 20 x intensity and the renderer multiplies by the particle's +0x44 (0.1),
+/// so a full-intensity fire is about a 2 m flame and a half-strength one is
+/// about 1 m.
+pub(crate) const FIRE_RADIUS_PER_INTENSITY: f64 = 2.0;
 
 /// MWIR (3-5 um) extinction by weather. Fog dominates: its droplets are close
 /// to the band's wavelength, so they scatter and absorb strongly, while rain
