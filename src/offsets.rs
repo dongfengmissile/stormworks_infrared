@@ -244,4 +244,9 @@ pub(crate) const SKY_PATH_CLAMP_M: f64 = 1500.0;
 /// In-band solar irradiance is ~150x the engine anchor (SUN_FLUX).
 pub(crate) const SUN_FLUX: f64 = 45.0;
 pub(crate) const SUN_DIST: f64 = 10000.0;
-pub(crate) const SUN_R_EFF: f64 = 44.0; // ~0.25 deg angular size at 10 km
+/// Angular radius of the sun at SUN_DIST: 393 m at 10 km is 2.25 deg. That is
+/// 9x the real sun (0.25 deg), sized to match the much larger sun sprite the
+/// game renders in the sky rather than the physical sun. SUN_FLUX is
+/// unchanged, so the bigger disc is dimmer per cell, not brighter — it stays
+/// saturated at typical gains.
+pub(crate) const SUN_R_EFF: f64 = 393.0;

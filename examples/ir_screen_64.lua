@@ -1,6 +1,4 @@
--- MC lua: draws the seeker's full-resolution IR image.
---
--- The seeker component runs ir.scan(...), this script fetches the frame that scan published and draws it.
+-- MC lua: draws the seeker's full-resolution IR image
 
 AUTO_CONTRAST = true -- scale the brightest cell to white
 GAIN = 1.0
@@ -10,12 +8,21 @@ frame_w = 0
 frame_h = 0
 
 function onTick()
-	if ir == nil or ir.frame == nil then
+	plugin_ok = (ir ~= nil and ir.frame ~= nil)
+	if not plugin_ok then
+		plugin_note = "no ir table here"
+		cells = nil
 		return
 	end
 	seeker_id = input.getNumber(1)
-	if seeker_id == nil or seeker_id < 0 then
+	if seeker_id == nil then
 		seeker_id = 0
+	end
+	if seeker_id < 0 then
+		plugin_ok = false
+		plugin_note = "seeker reports no plugin"
+		cells = nil
+		return
 	end
 	cells, frame_w, frame_h = ir.frame(seeker_id)
 end
@@ -23,6 +30,13 @@ end
 function onDraw()
 	screen.setColor(0, 0, 0)
 	screen.drawClear()
+
+	if not plugin_ok then
+		screen.setColor(255, 0, 0)
+		screen.drawTextBox(2, 2, screen.getWidth() - 4, screen.getHeight() - 4,
+			"stormworks_infrared\nplugin not injected\n" .. (plugin_note or ""))
+		return
+	end
 
 	if cells == nil or frame_w == nil or frame_h == nil then
 		return

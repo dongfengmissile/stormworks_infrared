@@ -45,7 +45,7 @@ You should see a line in the log confirming the hooks installed and the `ir` tab
 <Stormworks install>/logs/infrared_bootstrap.log
 ```
 
-The debug build additionally carries a diagnostic dump: weather, sun, scan direction, source list, source position, and more.
+The debug build additionally carries a diagnostic dump: weather, sun, scan direction, source list, source position and more.
 
 ## Lua API
 
@@ -98,37 +98,6 @@ A minimal component would look like:
 local cells, az_err, el_err, strength, flux, ambient, n_sources, id = ir.scan(
     az, el, 0.0125, 1000, 4, 4, 0.005, 0.001, 2, 1, false)
 ```
-
-### Drawing the image
-
-`ir.scan` runs in a **component** script, but `screen.*` only exists in a
-**microcontroller** script — and a logic composite between the two is 32 floats,
-which even packed two cells per float caps an image at 64 cells. For a larger
-image, call `ir.frame(id)` from the microcontroller instead: it returns the
-frame that seeker published, straight through the Lua state with no composite
-involved.
-
-```lua
--- microcontroller script; id comes from value 1 of the seeker's Data composite
-cells, width, height = ir.frame(id)
--- cells[i] is 0..255, row-major; draw it with screen.drawRectF
-```
-
-`ir.scan` returns the seeker's **identity** for exactly this reason, and the
-example seeker publishes it as value 1 of its Data composite. The
-microcontroller reads it off the composite it is wired to and passes it to
-`ir.frame(id)`, so it always draws the seeker it is connected to — including
-when several seekers share a vehicle, or when another vehicle on the field runs
-one too. No numbering to arrange, and nothing to collide: the id comes from the
-component, not from a choice two builders might make the same way.
-
-The example seeker also passes `cells_out = 0`, because with the image arriving
-through `ir.frame` nobody reads the returned cell table — that is 4096 Lua table
-insertions per scan at 64×64 that the scan can simply skip.
-
-`ir.frame(id)` returns `(cells, width, height)`, and nothing at all for id `0`
-or until that seeker has run a scan. See `examples/ir_screen_64.lua` for a 64×64 monitor script and
-`examples/ir_detector.lua` for the seeker side.
 
 ## What the seeker sees
 
