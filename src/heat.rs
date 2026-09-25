@@ -8,6 +8,8 @@ use crate::ir::Vec3;
 #[cfg(feature = "logging")]
 use crate::logging::log_line;
 use crate::memory::{game_fn, read_f32_at, read_f64_at, read_u32_at, read_usize_at};
+#[cfg(feature = "logging")]
+use crate::memory::readable;
 use crate::offsets::*;
 use crate::state::*;
 
@@ -16,8 +18,14 @@ use crate::state::*;
 /// Diagnostic dump of one heat container variant (logging builds only).
 #[cfg(feature = "logging")]
 pub(crate) unsafe fn log_heat_container(c: usize) {
-    if c == 0 {
-        log_line("heat container: NULL");
+    if DEEP_DUMP_DISABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    // c can be a stale captured hook argument and every pointer below is
+    // game-controlled, so EVERY dereference must be readable()-guarded. A
+    // range check alone passes on any garbage pointer inside userland.
+    if c < 0x10000 || !readable(c, 0x34) {
+        log_line("heat container: NULL or unreadable");
         return;
     }
     let slots = read_usize_at(c + 0x20);
@@ -34,12 +42,15 @@ pub(crate) unsafe fn log_heat_container(c: usize) {
     let dump = count.min(32);
     for i in 0..dump {
         let idx = ((start as usize + i as usize) % cap as usize) as usize;
+        if !readable(slots + idx * 8, 8) {
+            continue;
+        }
         let holder = read_usize_at(slots + idx * 8);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&holder) {
+        if !(0x10000..0x7fff_ffff_ffff).contains(&holder) || !readable(holder, 8) {
             continue;
         }
         let rec = read_usize_at(holder);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&rec) {
+        if !(0x10000..0x7fff_ffff_ffff).contains(&rec) || !readable(rec, 0x128) {
             continue;
         }
         let mode = *(rec as *const u8);
@@ -257,8 +268,11 @@ pub(crate) unsafe fn base_ambient_at(origin: Vec3) -> f32 {
 /// Diagnostic dump of the fires container (logging builds only).
 #[cfg(feature = "logging")]
 pub(crate) unsafe fn log_fires_container(c: usize) {
-    if c < 0x10000 {
-        log_line("fires container: NULL");
+    if DEEP_DUMP_DISABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    if c < 0x10000 || !readable(c, 0x11ec) {
+        log_line("fires container: NULL or unreadable");
         return;
     }
     let slots = read_usize_at(c + 0x11d8);
@@ -275,8 +289,11 @@ pub(crate) unsafe fn log_fires_container(c: usize) {
     let dump = (count as usize).min(4);
     for i in 0..dump {
         let idx = ((start as usize + i) % cap as usize) as usize;
+        if !readable(slots + idx * 8, 8) {
+            continue;
+        }
         let group = read_usize_at(slots + idx * 8);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&group) {
+        if !(0x10000..0x7fff_ffff_ffff).contains(&group) || !readable(group, 0x98) {
             continue;
         }
         let x = read_f64_at(group + 0x38);
@@ -293,7 +310,10 @@ pub(crate) unsafe fn log_fires_container(c: usize) {
 /// Diagnostic dump of the heat container's second ring (volume heat emitters).
 #[cfg(feature = "logging")]
 pub(crate) unsafe fn log_volume_heat_sources(c: usize) {
-    if c < 0x10000 {
+    if DEEP_DUMP_DISABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    if c < 0x10000 || !readable(c, 0x1c) {
         return;
     }
     let slots = read_usize_at(c + 0x8);
@@ -310,12 +330,15 @@ pub(crate) unsafe fn log_volume_heat_sources(c: usize) {
     let dump = (count as usize).min(6);
     for i in 0..dump {
         let idx = ((start as usize + i) % cap as usize) as usize;
+        if !readable(slots + idx * 8, 8) {
+            continue;
+        }
         let holder = read_usize_at(slots + idx * 8);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&holder) {
+        if !(0x10000..0x7fff_ffff_ffff).contains(&holder) || !readable(holder, 8) {
             continue;
         }
         let rec = read_usize_at(holder);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&rec) {
+        if !(0x10000..0x7fff_ffff_ffff).contains(&rec) || !readable(rec, 0x58) {
             continue;
         }
         log_line(&format!(

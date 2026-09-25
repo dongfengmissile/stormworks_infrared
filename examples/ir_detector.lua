@@ -1,16 +1,21 @@
 -- Component lua used on my IR seekers on the workshop
-NODE_CONFIG = 0
-NODE_DATA = 0
-NODE_STRENGTH = 0
-NODE_DETECT = 0
-RES_X = 8
-RES_Y = 8
-FOV_TURNS = 0.0125
-RANGE_M = 5000.0
-IR_GAIN = 0.01
-DETECT_FLUX = 0.001
-OCCLUSION = true
-FORWARD_AXIS = 2 -- 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
+fov = 0.0125
+range = 10000.0
+az = 0.0
+el = 0.0
+gain = 0.01
+dflux = 0.02
+rx = 8
+ry = 8
+fin_gain = 1.0
+occl = true
+forward_axis = 2 -- 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z
+
+cells = nil
+az_err = 0.0
+el_err = 0.0
+strength = 0.0
+detect = false
 
 function onAddToSimulation()
 	plugin_error_reported = false
@@ -18,21 +23,7 @@ end
 function onRemoveFromSimulation() end
 function onParse() end
 function onTick(tick_time)
-	fov = FOV_TURNS
-	range = RANGE_M
-	az = 0.0
-	el = 0.0
-	gain = IR_GAIN
-	dflux = DETECT_FLUX
-	rx = RES_X
-	ry = RES_Y
-	seeker_id = 0
-	occl = 1.0
-	if not OCCLUSION then
-		occl = 0.0
-	end
-
-	cfg = component.getInputLogicSlotComposite(NODE_CONFIG)
+	cfg = component.getInputLogicSlotComposite(0)
 	if cfg ~= nil and cfg.float_values ~= nil then
 		f = cfg.float_values
 		if f[1] ~= nil and f[1] > 0 then fov = f[1] end
@@ -43,21 +34,16 @@ function onTick(tick_time)
 		if f[6] ~= nil and f[6] > 0 then dflux = f[6] end
 		if f[7] ~= nil and f[7] > 0 then rx = math.floor(f[7] + 0.5) end
 		if f[8] ~= nil and f[8] > 0 then ry = math.floor(f[8] + 0.5) end
+		if f[9] ~= nil and f[9] ~= 0 then fin_gain = f[9] end
 	end
 	if rx < 1 then rx = 1 end
 	if rx > 64 then rx = 64 end
 	if ry < 1 then ry = 1 end
 	if ry > 64 then ry = 64 end
 
-	cells = nil
-	az_err = 0.0
-	el_err = 0.0
-	strength = 0.0
-	detect = false
-
 	if ir ~= nil and ir.scan ~= nil then
 		cells, az_err, el_err, peak_abs, flux, ambient, n_sources, seeker_id =
-			ir.scan(az, el, fov, range, rx, ry, gain, dflux, FORWARD_AXIS, occl, false, false)
+			ir.scan(az, el, fov, range, rx, ry, gain, dflux, forward_axis, occl, false, false)
 		if flux ~= nil then
 			strength = flux / gain
 			if strength > 1 then
@@ -71,8 +57,8 @@ function onTick(tick_time)
 	end
 
 	out = { float_values = {}, bool_values = {} }
-	out.float_values[1] = az_err
-	out.float_values[2] = el_err
+	out.float_values[1] = az_err * fin_gain
+	out.float_values[2] = el_err * fin_gain
 	out.float_values[3] = seeker_id or 0
 	out.float_values[4] = strength
 	out.float_values[5] = flux or 0
@@ -80,9 +66,9 @@ function onTick(tick_time)
 	out.float_values[7] = n_sources or 0
 	out.bool_values[1] = detect
 
-	component.setOutputLogicSlotComposite(NODE_DATA, out)
-	component.setOutputLogicSlotFloat(NODE_STRENGTH, strength)
-	component.setOutputLogicSlotBool(NODE_DETECT, detect)
+	component.setOutputLogicSlotComposite(0, out)
+	component.setOutputLogicSlotFloat(0, flux)
+	component.setOutputLogicSlotBool(0, detect)
 
 
 	if seeker_id < 0 and not plugin_error_reported then

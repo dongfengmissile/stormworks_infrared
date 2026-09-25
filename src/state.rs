@@ -114,6 +114,14 @@ pub(crate) static EMITTER_PENDING: Mutex<Vec<(usize, u64, f64, f64, f64, f64, f6
 /// Anything alive refreshes its entry every tick, so 2 s is generous.
 pub(crate) const EMITTER_STALE_MS: u64 = 2000;
 
+/// Kill switch for the verbose build's deep field dumps (ring walkers and
+/// class-field readers). They are readable()-guarded, but if the verbose
+/// build ever still crashes the game, this turns them all off without a
+/// rebuild: INFRARED_NO_DEEPDUMP=1 or an `infrared_disable_deepdump` marker
+/// file next to the log.
+pub(crate) static DEEP_DUMP_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Milliseconds since the plugin loaded - the freshness stamp for state that

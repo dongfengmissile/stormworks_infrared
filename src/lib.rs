@@ -65,7 +65,7 @@ use crate::hooks::install_hooks;
 use crate::logging::{log_line, set_log_path};
 use std::io::Write;
 use crate::memory::self_module_path;
-use crate::offsets::GAME_BUILD_LABEL;
+use crate::offsets::{GAME_BUILD_LABEL, PLUGIN_BUILD_LABEL};
 use crate::state::{MODULE_BASE, REGISTRAR_HITS, SELF_MODULE};
 
 fn bootstrap() {
@@ -85,7 +85,7 @@ fn bootstrap() {
     set_log_path(log_path);
 
     log_line(&format!(
-        "infrared bootstrap start build={GAME_BUILD_LABEL} dll={}",
+        "infrared bootstrap start build={GAME_BUILD_LABEL} plugin={PLUGIN_BUILD_LABEL} dll={}",
         dll_path.display()
     ));
 
@@ -206,6 +206,12 @@ temp={temp_c:.1} C",
     if exhaust_disabled {
         crate::state::EXHAUST_HOOKS_DISABLED.store(true, Ordering::SeqCst);
         log_line("exhaust hooks disabled by request (INFRARED_NO_EXHAUST / marker file)");
+    }
+    if std::env::var("INFRARED_NO_DEEPDUMP").as_deref() == Ok("1")
+        || plugin_dir.join("infrared_disable_deepdump").exists()
+    {
+        crate::state::DEEP_DUMP_DISABLED.store(true, Ordering::SeqCst);
+        log_line("deep field dumps disabled by request (INFRARED_NO_DEEPDUMP / marker file)");
     }
     if std::env::var("INFRARED_NO_TICKS").as_deref() == Ok("1")
         || plugin_dir.join("infrared_disable_rocket").exists()

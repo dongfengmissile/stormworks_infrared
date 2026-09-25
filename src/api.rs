@@ -2,7 +2,7 @@
 //! table registration the component registrar hook invokes.
 
 use std::ffi::c_void;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::heat::{base_ambient_at, temperature_at, variant_args};
 #[cfg(feature = "logging")]
@@ -238,16 +238,10 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
         let mut base_temp = 20.0f64;
         let mut source_count = 0usize;
 
-        // Aiming diagnostics + cue state, hoisted for the throttled log.
-        // Diagnostics-only mirror of the scan state (logging builds): the
-        // throttled dump prints the boresight, steering and cone. diag_visible
-        // is kept unconditionally — the out-of-cone cueing reads it.
+        // Diagnostics-only scan state for the throttled verbose log.
         #[cfg(feature = "logging")]
         let mut diag_fwd = (0.0f64, 0.0f64, 0.0f64);
-        // Filled from the pre-cone snapshot below; in player builds the
-        // initial value is always overwritten before the first read, hence the
-        // allow. The vector itself is read unconditionally by cueing.
-        #[allow(unused_assignments)]
+        #[cfg(feature = "logging")]
         let mut diag_visible: Vec<(f64, f64, f64, f64, f64)> = Vec::new();
         #[cfg(feature = "logging")]
         let mut diag_fov = 0.0f64;
@@ -255,6 +249,10 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
         let mut diag_cone = 0.0f64;
         #[cfg(feature = "logging")]
         let mut diag_steer = (0.0f64, 0.0f64);
+        // Normalised centroid (wx/ws, wy/ws, weight_sum) for the throttled
+        // dump - lets a pinned-at-centre error be told apart from a real one.
+        #[allow(unused_assignments)]
+        let mut diag_centroid = (0.0f64, 0.0f64, 0.0f64);
         let mut packed_vals: Vec<f64> = Vec::new();
 
         let component = lua_component(lua);
@@ -280,6 +278,18 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
             let fov_rad = fov * TAU;
             let az_center = az_steer * TAU;
             let el_center = el_steer * TAU;
+
+            // One line per plugin load: proves which cone geometry is running
+            // and records the configured FOV, so "is the game executing the
+            // new build" is answerable from the player build's bootstrap log.
+            static CONE_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !CONE_LOGGED.swap(true, Ordering::Relaxed) {
+                log_line(&format!(
+                    "scan armed: fov={fov:.4} turns ({:.2} deg full, {:.2} deg half-angle), \nerror sources: in-cone centroid only",
+                    fov_rad.to_degrees(),
+                    (fov_rad * 0.5).to_degrees()
+                ));
+            }
 
             let mut weight_sum = 0.0f64;
             let mut weight_x = 0.0f64;
@@ -352,43 +362,78 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                 }
             }
 
-            // Pre-cone snapshot for aiming diagnostics and cueing.
+            // Pre-cone snapshot for verbose diagnostics only.
             #[cfg(feature = "logging")]
             {
                 diag_fwd = forward;
                 diag_fov = fov_rad;
-                diag_cone = fov_rad * 0.5 + az_sp.max(el_sp);
+                diag_cone = fov_rad * 0.5;
                 diag_steer = (az_center, el_center);
+                diag_visible = sources
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.az,
+                            s.el,
+                            s.flux,
+                            s.theta,
+                            if s.sky { 1.0 } else { 0.0 },
+                        )
+                    })
+                    .collect();
             }
-            diag_visible = sources
-                .iter()
-                .map(|s| {
-                    (
-                        s.az,
-                        s.el,
-                        s.flux,
-                        s.theta,
-                        if s.sky { 1.0 } else { 0.0 },
-                    )
-                })
-                .collect();
 
-            // Acquisition cone: keep only sources the (steered) array can see,
-            // and total the flux they deliver. The total — not the peak cell —
-            // is what a real seeker detects, and it is conserved regardless of
-            // FOV, so a narrower field costs no detection range.
+            // Guidance comes from source directions, not the raster centroid:
+            // a sub-pixel emitter can straddle cells symmetrically and make
+            // that centroid exactly boresight while the source is off-axis.
+            // Prefer the brightest in-FOV emitter; with an empty FOV, use the
+            // brightest forward-hemisphere emitter so a gimbal can slew to it.
+            // Sky sources remain visible, but do not steer the seeker.
+            let mut brightest_in_cone: Option<(f64, f64, f64)> = None;
+            let mut brightest_forward: Option<(f64, f64, f64)> = None;
+            for s in &sources {
+                if s.sky || !s.flux.is_finite() || s.flux <= 0.0 {
+                    continue;
+                }
+                let d = s.az - az_center;
+                let daz = d - TAU * (d / TAU).round();
+                let del = s.el - el_center;
+                let off = ((daz * s.el.cos().max(0.2)).powi(2) + del * del).sqrt();
+                let candidate = (s.flux, daz, del);
+                let forward_dot = s.el.sin() * el_center.sin()
+                    + s.el.cos() * el_center.cos() * daz.cos();
+                if forward_dot > 0.0
+                    && brightest_forward.map_or(true, |best| s.flux > best.0)
+                {
+                    brightest_forward = Some(candidate);
+                }
+                if off <= fov_rad * 0.5
+                    && brightest_in_cone.map_or(true, |best| s.flux > best.0)
+                {
+                    brightest_in_cone = Some(candidate);
+                }
+            }
+            if let Some((_, daz, del)) = brightest_in_cone.or(brightest_forward) {
+                // Absolute angular offsets in turns, independent of FOV and
+                // pixel resolution (0.37 degrees is about 0.00103 turns).
+                az_error = daz / TAU;
+                el_error = del / TAU;
+            }
+
+            // The configured FOV still gates the rendered image, detection
+            // flux and source count; steering above is independent of raster.
             sources.retain(|s| {
                 let d = s.az - az_center;
                 let daz = d - TAU * (d / TAU).round();
                 let del = s.el - el_center;
                 let a = daz * s.el.cos().max(0.2);
-                let inside = (a * a + del * del).sqrt()
-                    < fov_rad * 0.5 + az_sp.max(el_sp) + s.theta;
+                let inside = (a * a + del * del).sqrt() <= fov_rad * 0.5;
                 if inside {
                     total_flux += s.flux;
                 }
                 inside
             });
+            source_count = sources.len();
 
             // Snapshot the survivors for the heartbeat: distance, effective
             // radius and flux are enough to identify an emitter and back-solve
@@ -406,25 +451,6 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                         s.sky,
                         s.temp_c,
                     ));
-                }
-            }
-
-            // Cued acquisition: with an empty cone, report the direction to
-            // the brightest source inside the forward hemisphere (~80 deg) as
-            // the az/el error so the operator or a guidance loop can slew onto
-            // it; the source only counts as detected once it enters the cone.
-            let mut cue: Option<(f64, f64)> = None;
-            let mut cue_blip = false; // sky sources steer, but never paint
-            if sources.is_empty() {
-                let mut best = 0.0f64;
-                for s in &diag_visible {
-                    let fx = s.1.cos() * s.0.cos();
-                    if fx < 0.2 || s.2 <= best {
-                        continue;
-                    }
-                    best = s.2;
-                    cue = Some((s.0, s.1));
-                    cue_blip = s.4 <= 0.5;
                 }
             }
 
@@ -478,7 +504,23 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                 }
             }
 
-            // Normalise the image and centroid from the final cell values.
+            // Keep the raw image centroid for diagnostics only. Guidance is
+            // computed from source angles above, before FOV rasterization, so a
+            // sub-pixel emitter cannot disappear into a symmetric pixel blob.
+            for (index, value) in cells.iter().enumerate() {
+                let col = (index as i32 % res_x) as f64;
+                let row = (index as i32 / res_x) as f64;
+                weight_sum += value;
+                weight_x += value * (col + 0.5) / res_x as f64;
+                weight_y += value * (0.5 - (row + 0.5) / res_y as f64);
+            }
+            diag_centroid = (
+                weight_x / weight_sum.max(1e-9),
+                weight_y / weight_sum.max(1e-9),
+                weight_sum,
+            );
+
+            // Normalize the display image independently of guidance.
             for value in cells.iter_mut() {
                 let norm = if gain > 1e-9 { *value / gain } else { 0.0 };
                 *value = norm.clamp(0.0, 1.0);
@@ -488,43 +530,6 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
             } else {
                 0.0
             };
-            for (index, value) in cells.iter().enumerate() {
-                let col = (index as i32 % res_x) as f64;
-                let row = (index as i32 / res_x) as f64;
-                weight_sum += value;
-                weight_x += value * (col + 0.5) / res_x as f64;
-                weight_y += value * (0.5 - (row + 0.5) / res_y as f64);
-            }
-
-            if weight_sum > 1e-9 {
-                az_error = (weight_x / weight_sum - 0.5) * fov;
-                el_error = (weight_y / weight_sum) * fov;
-            }
-
-            // Paint the cue blip after normalisation so it stays a faint dot
-            // and never contributes to the centroid above.
-            if let Some((cue_az, cue_el)) = cue {
-                let d = cue_az - az_center;
-                let daz = d - TAU * (d / TAU).round();
-                let del = cue_el - el_center;
-                // The steering cue is always emitted — it is what a guidance
-                // loop slews on — but only real (heat/fire) targets paint a
-                // blip. A sky source (the sun) out of the FOV must not light
-                // up a pixel on the array: the array shows the field of view,
-                // not the whole sky.
-                az_error = (daz / TAU).clamp(-0.5, 0.5);
-                el_error = (del / TAU).clamp(-0.5, 0.5);
-                if cue_blip {
-                    let col_f = (daz / fov_rad + 0.5) * res_x as f64 - 0.5;
-                    let row_f = (0.5 - del / fov_rad) * res_y as f64 - 0.5;
-                    let col = (col_f.round() as i32).clamp(0, res_x - 1) as usize;
-                    let row = (row_f.round() as i32).clamp(0, res_y - 1) as usize;
-                    let idx = row * res_x as usize + col;
-                    if cells[idx] < 0.08 {
-                        cells[idx] = 0.08;
-                    }
-                }
-            }
 
             // Publish the rendered frame for the drawing environment, under this
             // seeker's identity. A logic composite is 32 floats - 64 packed
@@ -579,7 +584,8 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
             {
                 let ready = TEMP_READY.load(Ordering::SeqCst);
                 log_line(&format!(
-                    "scan: sources={} total_flux={:.5} base={} strength {:.3}",
+                    "scan: sources={} total_flux={:.5} base={} strength {:.3} \
+error=({:+.6},{:+.6}) turns centroid wx/ws={:.4} wy/ws={:.4} cells_lit={} peak={:.3}",
                     source_count,
                     total_flux,
                     if ready {
@@ -587,7 +593,13 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                     } else {
                         "n/a".to_string()
                     },
-                    strength
+                    strength,
+                    az_error,
+                    el_error,
+                    diag_centroid.0,
+                    diag_centroid.1,
+                    cells.iter().filter(|v| **v > 0.0).count(),
+                    cells.iter().cloned().fold(0.0f64, f64::max),
                 ));
                 log_line(&format!(
                     "scan boresight fwd=({:.3},{:.3},{:.3}) fov={:.1} deg steer=({:+.1},{:+.1}) deg cone=+-{:.1} deg",

@@ -447,6 +447,9 @@ unsafe fn dump_class_fields(
     families: &[&str],
     label: &str,
 ) {
+    if DEEP_DUMP_DISABLED.load(Ordering::Relaxed) {
+        return;
+    }
     let mut seen: Vec<usize> = Vec::new();
     let mut printed = 0usize;
     for sample in samples.iter().filter(|sample| families.contains(&sample.family)) {

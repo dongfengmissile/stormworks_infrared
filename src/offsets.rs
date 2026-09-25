@@ -7,6 +7,12 @@
 /// f9206d85c82f4d02fd0ac391781d19c5c68394a9ffc48accca0e1f5966db8699
 pub(crate) const GAME_BUILD_LABEL: &str = "f9206d85c82f";
 
+/// Unique stamp of THIS plugin binary (unix seconds at compile time), logged
+/// at bootstrap. On-disk checksums cannot tell you what a running game has
+/// loaded; this can - the stamp in the log must match the stamp of the build
+/// you deployed.
+pub(crate) const PLUGIN_BUILD_LABEL: &str = env!("INFRARED_BUILD_STAMP");
+
 // RVAs (image base 0x140000000).
 pub(crate) const RVA_COMPONENT_LUA_REGISTRAR: usize = 0x0032_be50; // FUN_14032be50
 // The screen/microcontroller Lua initializer: it builds the `debug`, `async` and
