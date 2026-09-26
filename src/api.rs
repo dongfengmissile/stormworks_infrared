@@ -386,11 +386,12 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
             // Guidance comes from source directions, not the raster centroid:
             // a sub-pixel emitter can straddle cells symmetrically and make
             // that centroid exactly boresight while the source is off-axis.
-            // Prefer the brightest in-FOV emitter; with an empty FOV, use the
-            // brightest forward-hemisphere emitter so a gimbal can slew to it.
-            // Sky sources remain visible, but do not steer the seeker.
+            // Only sources inside the configured FOV may steer the seeker. A
+            // target outside it leaves the errors at zero, so a missile whose
+            // seeker is pointed away flies straight instead of being pulled
+            // onto whatever heat source happens to be in front of the hull.
+            // Sky sources remain visible in the image, but never steer.
             let mut brightest_in_cone: Option<(f64, f64, f64)> = None;
-            let mut brightest_forward: Option<(f64, f64, f64)> = None;
             for s in &sources {
                 if s.sky || !s.flux.is_finite() || s.flux <= 0.0 {
                     continue;
@@ -399,21 +400,13 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                 let daz = d - TAU * (d / TAU).round();
                 let del = s.el - el_center;
                 let off = ((daz * s.el.cos().max(0.2)).powi(2) + del * del).sqrt();
-                let candidate = (s.flux, daz, del);
-                let forward_dot = s.el.sin() * el_center.sin()
-                    + s.el.cos() * el_center.cos() * daz.cos();
-                if forward_dot > 0.0
-                    && brightest_forward.map_or(true, |best| s.flux > best.0)
-                {
-                    brightest_forward = Some(candidate);
-                }
                 if off <= fov_rad * 0.5
                     && brightest_in_cone.map_or(true, |best| s.flux > best.0)
                 {
-                    brightest_in_cone = Some(candidate);
+                    brightest_in_cone = Some((s.flux, daz, del));
                 }
             }
-            if let Some((_, daz, del)) = brightest_in_cone.or(brightest_forward) {
+            if let Some((_, daz, del)) = brightest_in_cone {
                 // Absolute angular offsets in turns, independent of FOV and
                 // pixel resolution (0.37 degrees is about 0.00103 turns).
                 az_error = daz / TAU;
