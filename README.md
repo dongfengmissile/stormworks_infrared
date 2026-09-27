@@ -109,12 +109,6 @@ local cells, az_err, el_err, strength, flux, ambient, n_sources, id = ir.scan(
 
 The plugin checks each function it hooks before touching it. If a game update moves something, that hook is skipped and reported in the log rather than causing undefined behaviour, and the rest of the plugin keeps working on whatever is still valid.
 
-## Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
-dual licensed as above, without any additional terms or conditions.
-
 ## Disclaimer
 
 I am not personally affiliated with the developers or publishers of Stormworks: Build and Rescue, nor have they endorsed this project. Stormworks: Build and Rescue and any of its content or materials are the property of their respective owners.
