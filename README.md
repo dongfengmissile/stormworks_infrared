@@ -2,8 +2,6 @@
 
 A plugin for [Stormworks: Build and Rescue](https://store.steampowered.com/app/573090/Stormworks_Build_and_Rescue/) that exposes the game's **own heat and temperature system** to component-mod Lua scripts. It adds a global `ir` table, so custom components can build real infrared seekers, heat detectors and homing guidance.
 
-Targets the 64-bit Windows build (`stormworks64.exe`), whether it runs natively or through Proton/WINE. I developed it and use it on Linux under Proton.
-
 ## READ THIS FIRST
 
 stormworks-infrared uses low-level techniques (DLL injection + function hooking) to extend the game, because there is no supported way to do it.
@@ -80,16 +78,16 @@ Returns:
 | value | meaning |
 |---|---|
 | `cells` | Lua array: `rx*ry` numbers `0..1`, or `ceil(rx*ry/2)` packed floats (empty when `cells_out` is `0`) |
-| `az_err`, `el_err` | direction of the target, in turns (greatest signal inside the acquisition cone; falls back to the brightest source within ~80° when the cone is empty, so a guidance loop can slew onto it) |
+| `az_err`, `el_err` | direction of the target, in turns (greatest signal inside the acquisition cone |
 | `strength` | `0..1` |
 | `total_flux` | raw IR power at the array — **this is the detection signal** |
-| `base_temp` | ambient temperature at the seeker, in Celsius |
+| `base_temp` | ambient temperature at the seeker |
 | `n_sources` | how many sources survived culling and occlusion |
-| `id` | this seeker's identity (24 bits, never 0, exact in an f32) — publish it to a microcontroller and pass it back to `ir.frame(id)` |
+| `id` | this seeker's identity (24 bits, never 0, exact in an f32) — pass it to `ir.frame(id)` |
 
 Two things worth knowing when tuning:
 
-- **A narrower FOV does not increase detection range.** `total_flux` is conserved no matter how the scene maps onto the cells, so FOV only buys angular precision (`fov/cells`) and a tighter acquisition cone — like a real seeker.
+- **A narrower FOV does not increase detection range.** `total_flux` is conserved no matter how the scene maps onto the cells, so FOV only buys angular precision (`fov/cells`) and a tighter acquisition cone.
 - **Detection is a threshold on `total_flux`,** so lowering `detect` extends range roughly as `sqrt(1/threshold)`.
 
 A minimal component would look like:
@@ -101,7 +99,7 @@ local cells, az_err, el_err, strength, flux, ambient, n_sources, id = ir.scan(
 
 ## What the seeker sees
 
-- **Heat sources** — engines, furnaces, fluid pipes, lava, anything the game tracks heat for. Emission is real in-band MWIR (3–5 µm) blackbody radiance, so a 400 °C target is hundreds of times brighter than a warm engine and can be picked up kilometres away, instead of needing to be close
+- **Heat sources** — every engine type, fluid pipes, anything the game tracks heat for.
 - **Fires and flares** — a lit flare registers as a fire, so it works as an IR countermeasure, but only once it is inside the acquisition cone
 - **The sun** — bright enough to decoy a missile and blocked by terrain
 - **Weather** — fog and rain attenuate every emitter, fog far more than rain
@@ -113,14 +111,11 @@ The plugin checks each function it hooks before touching it. If a game update mo
 
 ## Licenses
 
-Licensed under either of
-
  * Apache License, Version 2.0
    ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+   OR
  * MIT license
    ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
 
 ## Contribution
 
