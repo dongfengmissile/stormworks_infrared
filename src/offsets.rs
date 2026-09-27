@@ -260,6 +260,15 @@ pub(crate) const SCENE_TICK_PROLOGUE: [u8; 32] = [
 
 pub(crate) const TAU: f64 = std::f64::consts::TAU;
 
+/// Maximum seeker steering deflection, in turns.
+///
+/// Elevation is bounded to 90 degrees (0.25 turns) by construction, since it
+/// comes from `asin` of an up-axis component. Azimuth is circular, so the
+/// steering input is clamped to the same magnitude here to keep the scan cone
+/// inside the gimbal's physical deflection limit instead of letting a steering
+/// command swing it a half turn away.
+pub(crate) const STEER_LIMIT_TURNS: f64 = 0.25;
+
 /// Emission model: MWIR (3-5 um) in-band blackbody radiance, the band real IR
 /// missile seekers use. A 400 C furnace peaks at 4.3 um (Wien) while a 40 C
 /// engine radiates almost nothing in-band, so hot sources get their realistic

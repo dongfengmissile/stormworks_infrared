@@ -1,5 +1,5 @@
 -- Component lua used on my IR seekers on the workshop
-fov = 0.0125
+fov = 0.01
 range = 10000.0
 az = 0.0
 el = 0.0
@@ -57,8 +57,8 @@ function onTick(tick_time)
 	end
 
 	out = { float_values = {}, bool_values = {} }
-	out.float_values[1] = az_err * fin_gain
-	out.float_values[2] = el_err * fin_gain
+	out.float_values[1] = az + az_err * fin_gain
+	out.float_values[2] = el + el_err * fin_gain
 	out.float_values[3] = seeker_id or 0
 	out.float_values[4] = strength
 	out.float_values[5] = flux or 0

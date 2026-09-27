@@ -206,7 +206,12 @@ pub(crate) fn seeker_id(component: usize) -> u32 {
 pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
     let lua = lua as usize;
     unsafe {
-        let az_steer = lua_arg_number(lua, 1).unwrap_or(0.0);
+        // Azimuth steering is clamped to the same 0.25-turn deflection the
+        // elevation axis has by construction, so a steering command cannot
+        // swing the scan cone past the gimbal limit.
+        let az_steer = lua_arg_number(lua, 1)
+            .unwrap_or(0.0)
+            .clamp(-STEER_LIMIT_TURNS, STEER_LIMIT_TURNS);
         let el_steer = lua_arg_number(lua, 2).unwrap_or(0.0);
         let fov = lua_arg_number(lua, 3).unwrap_or(0.0833);
         let range = lua_arg_number(lua, 4).unwrap_or(200.0);
