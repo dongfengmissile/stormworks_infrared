@@ -109,14 +109,6 @@ local cells, az_err, el_err, strength, flux, ambient, n_sources, id = ir.scan(
 
 The plugin checks each function it hooks before touching it. If a game update moves something, that hook is skipped and reported in the log rather than causing undefined behaviour, and the rest of the plugin keeps working on whatever is still valid.
 
-## Licenses
-
- * Apache License, Version 2.0
-   ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-   OR
- * MIT license
-   ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
 ## Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
