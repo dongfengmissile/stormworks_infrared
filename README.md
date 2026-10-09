@@ -1,6 +1,6 @@
 # stormworks-infrared
 
-A plugin for [Stormworks: Build and Rescue](https://store.steampowered.com/app/573090/Stormworks_Build_and_Rescue/) that exposes the game's **own heat and temperature system** to component-mod Lua scripts. It adds a global `ir` table, so custom components can build real infrared seekers, heat detectors and homing guidance.
+A plugin for [Stormworks: Build and Rescue](https://store.steampowered.com/app/573090/Stormworks_Build_and_Rescue/) that exposes the game's own heat and temperature system to component-mod Lua scripts. It adds a global `ir` table, so custom components can build real infrared seekers, heat detectors and homing guidance.
 
 ## READ THIS FIRST
 
