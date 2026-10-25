@@ -52,6 +52,20 @@ pub(crate) fn band_radiance(t_k: f64) -> f64 {
     s * h / 3.0
 }
 
+/// [`band_radiance`] from a 1 C lookup table (-80..1200 C, linear between
+/// entries): cheap enough to evaluate for every vehicle cell.
+pub(crate) fn band_radiance_c(t_c: f32) -> f64 {
+    static TABLE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| (0..=1280).map(|i| band_radiance(i as f64 - 80.0 + 273.15)).collect());
+    if !t_c.is_finite() {
+        return 0.0;
+    }
+    let x = (t_c as f64 + 80.0).clamp(0.0, 1280.0);
+    let i = (x as usize).min(1279);
+    let f = x - i as f64;
+    table[i] * (1.0 - f) + table[i + 1] * f
+}
+
 /// Local weather. The game keeps its weather object on the scene at
 /// scene+0xbade8 (the day clock sits just after it at +0xbaec0): the live,
 /// smoothed fog factor is at +0x90 and rain at +0x98, while the cheat menu /

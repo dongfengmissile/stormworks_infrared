@@ -34,6 +34,8 @@
 //!   * [`sun`]     - the sun emitter and the day/night gate.
 //!   * [`api`]     - the `ir.probe` / `ir.scan` Lua functions.
 //!   * [`lua`]     - Lua C-API helpers.
+//!   * [`blocktemp`] - per-body block temperature grid (thermal simulation).
+//!   * [`flir`]    - FLIR camera view: block pass, replacement tonemap, F10.
 //!   * [`memory`]  - RVA resolution, prologue checks, primitive reads.
 //!   * [`logging`] - the single log file.
 
@@ -41,6 +43,10 @@
 #![allow(non_snake_case, non_upper_case_globals, dead_code)]
 
 mod api;
+mod blocktemp;
+mod fault;
+mod flir;
+mod fx;
 mod heat;
 mod hooks;
 mod ir;
@@ -68,6 +74,53 @@ use crate::memory::self_module_path;
 use crate::offsets::{GAME_BUILD_LABEL, PLUGIN_BUILD_LABEL};
 use crate::state::{MODULE_BASE, REGISTRAR_HITS, SELF_MODULE};
 
+/// Verbose builds: report every panic on the bootstrap log. A panic inside one
+/// of our `extern "system"` detours cannot unwind and aborts the process, and
+/// the vectored fault handler never sees it: this line is then the only
+/// evidence of where we were. The previous hook is chained so the panic still
+/// reaches the debugger/stderr exactly as it did before.
+#[cfg(feature = "logging")]
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // The hook itself must not recurse if formatting/logging panics.
+        static IN_HOOK: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !IN_HOOK.swap(true, Ordering::Relaxed) {
+            let message = match info.payload().downcast_ref::<&str>() {
+                Some(text) => (*text).to_string(),
+                None => info
+                    .payload()
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string()),
+            };
+            // One line per panic: a message with newlines stays one record.
+            let message: String = message
+                .chars()
+                .take(512)
+                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                .collect();
+            let (file, line, column) = info
+                .location()
+                .map(|loc| (loc.file(), loc.line(), loc.column()))
+                .unwrap_or(("<unknown>", 0, 0));
+            let stage = crate::fault::STAGE.load(Ordering::Relaxed);
+            let thread = unsafe {
+                windows_sys::Win32::System::Threading::GetCurrentThreadId()
+            };
+            // `log_line` opens, writes and flushes once, so this survives the
+            // abort that follows a panic in a non-unwinding detour.
+            log_line(&format!(
+                "PANIC: {message} at {file}:{line}:{column} thread={thread} stage={} ({stage})",
+                crate::fault::stage_name(stage)
+            ));
+            IN_HOOK.store(false, Ordering::Relaxed);
+        }
+        previous(info);
+    }));
+}
+
 fn bootstrap() {
     let Some(dll_path) = self_module_path() else {
         return;
@@ -82,7 +135,15 @@ fn bootstrap() {
         // before the log had been read.
         let _ = fs::rename(&log_path, log_dir.join("infrared_bootstrap.prev.log"));
     }
-    set_log_path(log_path);
+    set_log_path(log_path.clone());
+    // Verbose builds: a panic that cannot unwind (any `extern "system"` detour)
+    // aborts the process without a FAULT line, so log it while we still can.
+    #[cfg(feature = "logging")]
+    install_panic_hook();
+    // Verbose builds: write one line per distinct fault address (access
+    // violation / illegal instruction / stack overflow) and keep the stage
+    // breadcrumb that line reports.
+    crate::fault::install(&log_path);
 
     log_line(&format!(
         "infrared bootstrap start build={GAME_BUILD_LABEL} plugin={PLUGIN_BUILD_LABEL} dll={}",
@@ -197,7 +258,6 @@ temp={temp_c:.1} C",
     }
     MODULE_BASE.store(base, Ordering::SeqCst);
     log_line(&format!("game module base = {base:#x}"));
-
     // Kill switch: lets a user bisect a suspected crash without a rebuild.
     // Either create `<game>/infrared_disable_exhaust` next to the log or set
     // INFRARED_NO_EXHAUST=1 before launching the game.
@@ -207,11 +267,12 @@ temp={temp_c:.1} C",
         crate::state::EXHAUST_HOOKS_DISABLED.store(true, Ordering::SeqCst);
         log_line("exhaust hooks disabled by request (INFRARED_NO_EXHAUST / marker file)");
     }
-    if std::env::var("INFRARED_NO_DEEPDUMP").as_deref() == Ok("1")
-        || plugin_dir.join("infrared_disable_deepdump").exists()
+    // Deep field dumps walk unchecked game pointers (two crashes traced there): opt-in only.
+    if std::env::var("INFRARED_DEEPDUMP").as_deref() == Ok("1")
+        || plugin_dir.join("infrared_enable_deepdump").exists()
     {
-        crate::state::DEEP_DUMP_DISABLED.store(true, Ordering::SeqCst);
-        log_line("deep field dumps disabled by request (INFRARED_NO_DEEPDUMP / marker file)");
+        crate::state::DEEP_DUMP_DISABLED.store(false, Ordering::SeqCst);
+        log_line("deep field dumps enabled by request (INFRARED_DEEPDUMP / marker file)");
     }
     if std::env::var("INFRARED_NO_TICKS").as_deref() == Ok("1")
         || plugin_dir.join("infrared_disable_rocket").exists()
@@ -251,6 +312,35 @@ temp={temp_c:.1} C",
         crate::state::SCREEN_HOOKS_DISABLED.store(true, Ordering::SeqCst);
         log_line("screen Lua init hook disabled by request");
     }
+    if std::env::var("INFRARED_NO_FLIR").as_deref() == Ok("1")
+        || plugin_dir.join("infrared_disable_flir").exists()
+    {
+        crate::state::FLIR_DISABLED.store(true, Ordering::SeqCst);
+        log_line("FLIR camera-view hooks disabled by request");
+    }
+
+    // Per-subsystem switches for the FLIR path (marker files next to the DLL,
+    // like the switches above): bisect a crash without a rebuild.
+    let blockpass_disabled = plugin_dir.join("infrared_disable_blockpass").exists();
+    if blockpass_disabled {
+        crate::state::BLOCKPASS_DISABLED.store(true, Ordering::SeqCst);
+        log_line("FLIR block substitution disabled by request (infrared_disable_blockpass)");
+    }
+    let sim_disabled = plugin_dir.join("infrared_disable_sim").exists();
+    if sim_disabled {
+        crate::state::SIM_DISABLED.store(true, Ordering::SeqCst);
+        log_line("block temperature sim disabled by request (infrared_disable_sim)");
+    }
+    let composite_disabled = plugin_dir.join("infrared_disable_composite").exists();
+    if composite_disabled {
+        crate::state::COMPOSITE_DISABLED.store(true, Ordering::SeqCst);
+        log_line("FLIR composite disabled by request (infrared_disable_composite)");
+    }
+    log_line(&format!(
+        "kill switches active: blockpass={blockpass_disabled} sim={sim_disabled} \
+composite={composite_disabled} flir={}",
+        crate::state::FLIR_DISABLED.load(Ordering::SeqCst)
+    ));
 
     match unsafe { install_hooks() } {
         Ok(()) => log_line(
@@ -278,8 +368,12 @@ uniforms, rocket/jet/preset/modular/water/steam ticks, exhaust)",
 }
 
 #[no_mangle]
-pub extern "system" fn DllMain(module: HINSTANCE, reason: u32, _reserved: *mut c_void) -> i32 {
+pub extern "system" fn DllMain(module: HINSTANCE, reason: u32, reserved: *mut c_void) -> i32 {
     const DLL_PROCESS_ATTACH: u32 = 1;
+    const DLL_PROCESS_DETACH: u32 = 0;
+    if reason == DLL_PROCESS_DETACH {
+        crate::fault::note_detach(!reserved.is_null());
+    }
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
             let _ = DisableThreadLibraryCalls(module);

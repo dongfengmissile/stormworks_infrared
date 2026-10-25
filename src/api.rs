@@ -1,5 +1,6 @@
-//! The Lua surface the components call: `ir.probe` and `ir.scan`, plus the
-//! table registration the component registrar hook invokes.
+//! The Lua surface the components call: `ir.probe` and `ir.scan` in the
+//! component-mod state, `ir.frame` / `ir.flir` / `ir.flir_config` in the microcontroller
+//! (screen) state, plus the table registration the two initializers invoke.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +15,7 @@ use crate::ir::{
 use crate::ir::{weather_fog_rain, weather_transmittance};
 use crate::logging::log_line;
 use crate::lua::*;
-use crate::memory::{game_fn, read_usize_at};
+use crate::memory::{game_fn, in_game_image, read_usize_at, readable};
 #[cfg(feature = "logging")]
 use crate::memory::{read_f32_at, read_u32_at};
 use crate::offsets::*;
@@ -65,15 +66,21 @@ pub(crate) unsafe fn register_ir_table(context: usize) {
 
 /// Register the `ir` table into the drawing (screen) Lua environment.
 ///
-/// The same three calls as the component-mod registration. That matters: the
-/// game's registrar creates a fresh table and sets it under the name, so if
-/// this state turned out to be the same one the component registrar already
-/// served, a shorter table would silently replace `ir` and take `ir.scan` away
-/// from the seeker. An identical table makes that replacement a no-op.
+/// `ir.frame` reads the image a seeker published, `ir.probe` samples the heat
+/// model, and `ir.flir_config` resolves this microcontroller's video link to
+/// the camera it feeds - none of them needs a component-handle upvalue.
 ///
-/// `ir.scan` from a state with no component context is harmless rather than
-/// dangerous: lua_component_handle only accepts the two upvalue tags the game
-/// uses, so it yields 0 and the scan simply finds nothing.
+/// `ir.scan` is deliberately absent: it is a seeker API (a component with a
+/// world matrix and a physics context for occlusion), and in this state the
+/// game's upvalues are per-table script objects (`screen`, `async`, ...), not
+/// component handles (RE_NOTES §1.7.1). Registering it here previously handed
+/// `lua_component` the address of this function's own local, which is neither a
+/// component nor valid after the initializer returned.
+///
+/// The upvalue is therefore NULL, the same value the game hands its own
+/// `debug` table, so `lua_component` / `lua_component_handle` return 0 instead
+/// of reading through a dangling pointer. A microcontroller call that needs its
+/// component derives it from the `L-8` back-pointer instead (`mc_component`).
 pub(crate) unsafe fn register_ir_screen_table(state: usize) {
     if state == 0 {
         return;
@@ -93,10 +100,6 @@ pub(crate) unsafe fn register_ir_screen_table(state: usize) {
 
     let pairs = [
         FnPair {
-            name: b"scan\0".as_ptr(),
-            func: ir_scan as *const () as usize,
-        },
-        FnPair {
             name: b"frame\0".as_ptr(),
             func: ir_frame as *const () as usize,
         },
@@ -105,27 +108,396 @@ pub(crate) unsafe fn register_ir_screen_table(state: usize) {
             func: ir_probe as *const () as usize,
         },
         FnPair {
+            name: b"flir_config\0".as_ptr(),
+            func: ir_flir_config as *const () as usize,
+        },
+        FnPair {
+            name: b"flir\0".as_ptr(),
+            func: ir_flir as *const () as usize,
+        },
+        FnPair {
             name: std::ptr::null(),
             func: 0,
         },
     ];
 
-    // The game's own initializers hand register_table a stack slot to receive
-    // the table, so a local is the safe destination here.
-    let mut destination: usize = 0;
-    register(
-        state,
-        &name_object as *const usize,
-        pairs.as_ptr(),
-        &mut destination as *mut usize as usize,
-    );
+    // The fourth argument is the lightuserdata the game installs as the one
+    // upvalue of every registered function. NULL is what the game itself hands
+    // its `debug` table, and nothing above dereferences it.
+    register(state, &name_object as *const usize, pairs.as_ptr(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// microcontroller component lookup (RE_NOTES §1.7.1-1.7.3)
+// ---------------------------------------------------------------------------
+
+/// `c_scene_vehicle_component_camera` vtable.
+const CAMERA_VTABLE_RVA: usize = 0x00b5_3420;
+/// `c_vehicle_logic_slot_output_video::vftable` - a camera's video output slot.
+const SLOT_OUTPUT_VIDEO_VTABLE_RVA: usize = 0x00b7_46f8;
+/// The microcontroller's embedded `c_microprocessor_lua_script`.
+const MC_SCRIPT_OFFSET: usize = 0x660;
+/// `node+0x28` / `node+0x30` of the MC's video input node (`comp+0x110`): the
+/// source slot and source node the game's per-tick link resolve writes.
+/// A camera's `c_vehicle_logic_slot_output_video` (camera + 0x190).
+const CAMERA_VIDEO_SLOT: usize = 0x190;
+
+/// Why a microcontroller call could not resolve a component or a camera, for
+/// the one-shot log line.
+const NO_MC_STATE: &str =
+    "not called from a microcontroller Lua state (no L-8 script back-pointer)";
+const NO_CAMERA: &str = "this microcontroller's video input is not fed by a camera video output";
+
+/// `c_microprocessor_lua_script` -> owning microcontroller component.
+///
+/// The game's screen init writes the script object to `*(u64*)(L-8)`
+/// (`0x2E5261`), and the script object is embedded in the component at
+/// `+0x660`, so `component = *(u64*)(L-8) - 0x660`. Both hops are validated
+/// (readable, and a class vtable inside the game image) before the component is
+/// returned, because a Lua state from the component-mod side has no such
+/// back-pointer.
+unsafe fn mc_component(lua: usize) -> Option<usize> {
+    if lua < 0x10000 || !readable(lua - 8, 8) {
+        return None;
+    }
+    let script = read_usize_at(lua - 8);
+    if !readable(script, 8) || !in_game_image(read_usize_at(script)) {
+        return None;
+    }
+    let base = MODULE_BASE.load(Ordering::SeqCst);
+    if base == 0 || read_usize_at(script) != base + LUA_SCRIPT_VTABLE_RVA {
+        return None;
+    }
+    let component = script.wrapping_sub(MC_SCRIPT_OFFSET);
+    if rd(component)? != base + LUA_BLOCK_VTABLE_RVA {
+        return None;
+    }
+    Some(component)
+}
+
+/// Vtable RVAs of the MC graph objects (RE_NOTES §1.7.3).
+const LUA_SCRIPT_VTABLE_RVA: usize = 0x00b6_f468; // c_microprocessor_lua_script
+const LUA_BLOCK_VTABLE_RVA: usize = 0x00b9_a710; // c_microprocessor_component_lua_script
+const OUT_VIDEO_NODE_VTABLE_RVA: usize = 0x00af_72c8; // ..._logic_node_output_video
+const BRIDGE_VIDEO_IN_VTABLE_RVA: usize = 0x00b0_72d8; // ..._bridge_video_input
+const VIDEO_SWITCHBOX_VTABLE_RVA: usize = 0x00b8_2ee8; // ..._video_switchbox
+/// Input node fields: source slot / source (graph) output node.
+const NODE_SRC_NODE: usize = 0x30;
+/// bridge_video_input's in-node (+0x50); switchbox in-nodes at +0x50 and +0x2A8.
+const SWITCHBOX_IN_NODES: [usize; 2] = [0x50, 0x2a8];
+/// Switchbox's cached bool switch value (bool in-node +0x500, value +0x38).
+const SWITCHBOX_STATE: usize = 0x538;
+const MC_VIDEO_IN_NODE: usize = 0x110;
+const MC_HOP_CAP: usize = 8;
+
+/// Guarded 8-aligned read.
+unsafe fn rd(p: usize) -> Option<usize> {
+    if p < 0x10000 || p & 7 != 0 || !readable(p, 8) {
+        return None;
+    }
+    Some(unsafe { read_usize_at(p) })
+}
+
+const MC_GROUP: usize = 0x9a8;
+const GROUP_VTABLE_RVA: usize = 0x00b4_6bd8;
+const GROUP_IN_MC: usize = 0x1c0;
+const MC_COMP_VTABLE_RVA: usize = 0x00b8_4dc8;
+const MC_BODY: usize = 0x28;
+const MC_INPUT_SLOT_VTABLE_RVA: usize = 0x00b7_e7e8; // c_vehicle_logic_slot_input_video
+const BRIDGE_INSLOT: usize = 0x78;
+const BODY_COMPONENTS: usize = 0x3f0; // ring: ptr, +8 cap, +0xC off, +0x10 n
+const BODY_VEHICLE: usize = 0x250;
+const VEHICLE_BODIES: usize = 0x50; // ring of 0x30-byte entries, body* at +0x18
+const SLOT_CONSUMERS: usize = 0x238; // ring: ptr, +8 cap, +0xC off, +0x10 n
+const RING_CAP_MAX: usize = 4096;
+const SCAN_BUDGET: usize = 20000;
+
+/// Diagnostics of one MC camera resolve.
+#[derive(Default, Debug)]
+struct McTrace {
+    group_vt: Option<usize>,
+    mc: usize,
+    mc_vt: Option<usize>,
+    inslot: usize,
+    inslot_vt: Option<usize>,
+    body: usize,
+    vehicle: usize,
+    bodies: usize,
+    cameras: usize,
+    consumer_counts: Vec<usize>,
+    hops: Vec<usize>,
+    result: &'static str,
+}
+
+/// Validated ring header at `p`: (ptr, cap, off, n).
+unsafe fn ring(p: usize) -> Option<(usize, usize, usize, usize)> {
+    unsafe {
+        let ptr = rd(p)?;
+        let cap = rd(p + 8)? & 0xffff_ffff;
+        let off = (rd(p + 8)? >> 32) & 0xffff_ffff;
+        let n = rd(p + 0x10)? & 0xffff_ffff;
+        if ptr == 0 || cap == 0 || cap > RING_CAP_MAX || n > cap {
+            return None;
+        }
+        Some((ptr, cap, off, n))
+    }
+}
+
+/// Find the MC's own input port slot by following the input node chain.
+unsafe fn mc_inslot(base: usize, lua_blk: usize, t: &mut McTrace) -> Option<usize> {
+    let mut in_node = lua_blk + MC_VIDEO_IN_NODE;
+    for _ in 0..MC_HOP_CAP {
+        let node = unsafe { rd(in_node + NODE_SRC_NODE)? };
+        let vt = unsafe { rd(node)? };
+        t.hops.push(vt.wrapping_sub(base));
+        if vt != base + OUT_VIDEO_NODE_VTABLE_RVA {
+            return None;
+        }
+        let owner = unsafe { rd(node + 8)? };
+        let ovt = unsafe { rd(owner)? };
+        t.hops.push(ovt.wrapping_sub(base));
+        if ovt == base + BRIDGE_VIDEO_IN_VTABLE_RVA {
+            let slot = unsafe { rd(owner + BRIDGE_INSLOT)? };
+            t.inslot = slot;
+            t.inslot_vt = unsafe { rd(slot) };
+            return (t.inslot_vt == Some(base + MC_INPUT_SLOT_VTABLE_RVA)).then_some(slot);
+        } else if ovt == base + VIDEO_SWITCHBOX_VTABLE_RVA {
+            // Follow the input the switch currently forwards (0x140389DA0:
+            // state byte != 0 -> +0x50, else +0x2A8).
+            if !readable(owner + SWITCHBOX_STATE, 1) {
+                return None;
+            }
+            let on = unsafe { *((owner + SWITCHBOX_STATE) as *const u8) } != 0;
+            in_node = owner + SWITCHBOX_IN_NODES[if on { 0 } else { 1 }];
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// Scan one body's components; push cameras into `cams`. Returns the camera
+/// whose consumer ring contains `inslot`.
+unsafe fn scan_body(
+    base: usize,
+    body: usize,
+    inslot: usize,
+    cams: &mut Vec<usize>,
+    budget: &mut usize,
+    t: &mut McTrace,
+) -> Option<usize> {
+    unsafe {
+        let (arr, cap, off, n) = ring(body + BODY_COMPONENTS)?;
+        let mut found = None;
+        for i in 0..n {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
+            let Some(c) = rd(arr + 8 * ((i + off) % cap)) else { continue };
+            if c == 0 || rd(c) != Some(base + CAMERA_VTABLE_RVA) || cams.contains(&c) {
+                continue;
+            }
+            cams.push(c);
+            t.cameras += 1;
+            let Some((cp, cc, co, cn)) = ring(c + CAMERA_VIDEO_SLOT + SLOT_CONSUMERS) else {
+                t.consumer_counts.push(usize::MAX);
+                continue;
+            };
+            t.consumer_counts.push(cn);
+            if inslot != 0 && found.is_none() {
+                for j in 0..cn {
+                    if *budget == 0 {
+                        break;
+                    }
+                    *budget -= 1;
+                    if rd(cp + 8 * ((j + co) % cc)) == Some(inslot) {
+                        found = Some(c);
+                        break;
+                    }
+                }
+            }
+        }
+        found
+    }
+}
+
+unsafe fn mc_resolve(lua_blk: usize, t: &mut McTrace) -> Option<usize> {
+    let base = MODULE_BASE.load(Ordering::SeqCst);
+    if base == 0 {
+        return None;
+    }
+    unsafe {
+        let group = rd(lua_blk + MC_GROUP)?;
+        t.group_vt = rd(group);
+        if t.group_vt != Some(base + GROUP_VTABLE_RVA) {
+            t.result = "group vt";
+            return None;
+        }
+        t.mc = group.wrapping_sub(GROUP_IN_MC);
+        t.mc_vt = rd(t.mc);
+        if t.mc_vt != Some(base + MC_COMP_VTABLE_RVA) {
+            t.result = "mc vt";
+            return None;
+        }
+        let inslot = mc_inslot(base, lua_blk, t).unwrap_or(0);
+        t.body = rd(t.mc + MC_BODY)?;
+        if t.body == 0 {
+            t.result = "no body";
+            return None;
+        }
+        let mut cams = Vec::new();
+        let mut budget = SCAN_BUDGET;
+        if let Some(c) = scan_body(base, t.body, inslot, &mut cams, &mut budget, t) {
+            t.result = "consumer match (body)";
+            return Some(c);
+        }
+        t.vehicle = rd(t.body + BODY_VEHICLE).unwrap_or(0);
+        if t.vehicle != 0 {
+            // Other bodies (subgrids) of the vehicle: the body-pointer set at
+            // vehicle+0 that blocktemp walks every tick, then the older 0x30-byte
+            // ring at +0x50. A camera on a different subgrid than the MC was
+            // never found through the ring alone.
+            let mut others: Vec<usize> = Vec::new();
+            if let Some(set) = crate::blocktemp::read_set(t.vehicle, 256, 8, crate::blocktemp::MAX_SET_MOD) {
+                others.extend((0..set.count()).map(|j| set.item(j)));
+            }
+            if let Some((arr, cap, off, n)) = ring(t.vehicle + VEHICLE_BODIES) {
+                others.extend((0..n).filter_map(|i| rd(arr + 0x30 * ((i + off) % cap) + 0x18)));
+            }
+            for b in others {
+                if b == 0 || b == t.body || rd(b + BODY_VEHICLE) != Some(t.vehicle) {
+                    continue;
+                }
+                t.bodies += 1;
+                if let Some(c) = scan_body(base, b, inslot, &mut cams, &mut budget, t) {
+                    t.result = "consumer match (vehicle)";
+                    return Some(c);
+                }
+            }
+        }
+        if cams.len() == 1 {
+            t.result = "sole camera fallback";
+            return Some(cams[0]);
+        }
+        t.result = "no match / ambiguous";
+        None
+    }
+}
+
+/// The camera whose video output feeds the MC Lua block `component` (the
+/// `lua_blk` from `mc_component`), delivered as `(camera, 0)`.
+unsafe fn mc_camera(component: usize) -> Option<(usize, usize)> {
+    let base = MODULE_BASE.load(Ordering::SeqCst);
+    if base == 0 {
+        return None;
+    }
+    unsafe {
+        if rd(component)? != base + LUA_BLOCK_VTABLE_RVA {
+            return None;
+        }
+        // The full resolve scans every component of the vehicle (two per tick per
+        // script: ir.flir + ir.flir_config). Reuse the last answer while the
+        // cheap last hop still holds: the camera keeps its vtable and its
+        // consumer ring still contains this MC's input slot (re-derived from the
+        // live node chain). A sole-camera fallback (no slot) is re-scanned
+        // every second.
+        let now = crate::state::now_ms();
+        let mut t = McTrace::default();
+        let inslot = mc_inslot(base, component, &mut t).unwrap_or(0);
+        let cached = MC_CAMERA_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&component)
+            .copied();
+        if let Some((camera, slot, at_ms)) = cached {
+            let fresh = if slot != 0 {
+                slot == inslot && camera_feeds(base, camera, slot)
+            } else {
+                inslot == 0
+                    && now.saturating_sub(at_ms) < 1000
+                    && rd(camera) == Some(base + CAMERA_VTABLE_RVA)
+            };
+            if fresh {
+                return Some((camera, 0));
+            }
+        }
+        let camera = mc_resolve(component, &mut McTrace::default())?;
+        let mut cache = MC_CAMERA_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(component, (camera, inslot, now));
+        Some((camera, 0))
+    }
+}
+
+/// lua block -> (camera, input slot it was matched through, resolve time ms).
+static MC_CAMERA_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<usize, (usize, usize, u64)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// `camera` is still a camera and its video output's consumer ring holds `slot`.
+unsafe fn camera_feeds(base: usize, camera: usize, slot: usize) -> bool {
+    unsafe {
+        if rd(camera) != Some(base + CAMERA_VTABLE_RVA) {
+            return false;
+        }
+        let Some((cp, cc, co, cn)) = ring(camera + CAMERA_VIDEO_SLOT + SLOT_CONSUMERS) else {
+            return false;
+        };
+        (0..cn.min(64)).any(|j| rd(cp + 8 * ((j + co) % cc)) == Some(slot))
+    }
+}
+
+/// One-shot (logging builds) diagnostics for a failed camera resolve.
+#[cfg(feature = "logging")]
+unsafe fn log_mc_failure(lua: usize) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let base = MODULE_BASE.load(Ordering::SeqCst);
+    unsafe {
+        let script = rd(lua.wrapping_sub(8)).unwrap_or(0);
+        let lua_blk = script.wrapping_sub(MC_SCRIPT_OFFSET);
+        let mut t = McTrace::default();
+        let r = mc_resolve(lua_blk, &mut t);
+        let f = |v: Option<usize>| v.map_or("unreadable".to_string(), |v| format!("{:#x}", v.wrapping_sub(base)));
+        log_line(&format!(
+            "mc camera resolve failed: lua_blk={lua_blk:#x} result={:?} ({}) group_vt={} (want {GROUP_VTABLE_RVA:#x}) \
+mc={:#x} vt={} (want {MC_COMP_VTABLE_RVA:#x}) inslot={:#x} vt={} (want {MC_INPUT_SLOT_VTABLE_RVA:#x}) \
+body={:#x} vehicle={:#x} other_bodies={} cameras_scanned={} consumer_counts={:?} hop_vtable_rvas={:#x?} payload_count={:?}",
+            r.map(|c| c - base),
+            t.result,
+            f(t.group_vt),
+            t.mc,
+            f(t.mc_vt),
+            t.inslot,
+            f(t.inslot_vt),
+            t.body,
+            t.vehicle,
+            t.bodies,
+            t.cameras,
+            t.consumer_counts,
+            t.hops,
+            readable(lua_blk + 0x360, 4).then(|| read_u32_at(lua_blk + 0x360)),
+        ));
+    }
+}
+#[cfg(not(feature = "logging"))]
+unsafe fn log_mc_failure(_lua: usize) {}
 
 // ---------------------------------------------------------------------------
 // injected Lua functions
 // ---------------------------------------------------------------------------
 
 pub(crate) extern "C" fn ir_probe(lua: *mut c_void) -> i32 {
+    // A panic must never unwind through the Lua C function: the game aborts.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { probe_inner(lua) }))
+        .unwrap_or(0)
+}
+
+unsafe fn probe_inner(lua: *mut c_void) -> i32 {
     let lua = lua as usize;
     unsafe {
         let x = lua_arg_number(lua, 1).unwrap_or(0.0);
@@ -150,6 +522,12 @@ pub(crate) extern "C" fn ir_probe(lua: *mut c_void) -> i32 {
 /// either, so it cannot run the scan itself - it reads what the seeker
 /// published instead.
 pub(crate) extern "C" fn ir_frame(lua: *mut c_void) -> i32 {
+    // A panic must never unwind through the Lua C function: the game aborts.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { frame_inner(lua) }))
+        .unwrap_or(0)
+}
+
+unsafe fn frame_inner(lua: *mut c_void) -> i32 {
     let lua = lua as usize;
     unsafe {
         // arg 1: which seeker's frame. 0 (or omitted) returns nothing, because
@@ -202,8 +580,192 @@ pub(crate) fn seeker_id(component: usize) -> u32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FLIR camera configuration (`ir.flir_config`, microcontroller state only)
+// ---------------------------------------------------------------------------
+
+/// Narrowest display window accepted. A zero (or near-zero) span would divide
+/// the shader by ~0 instead of mapping temperatures, so it is rejected as an
+/// invalid argument rather than producing an unusable image.
+const FLIR_MIN_WINDOW_C: f32 = 0.01;
+/// Cap on configured cameras. Keys are component pointers and a long session
+/// spawns cameras repeatedly, so the map is bounded; on overflow it is cleared
+/// and every live script republishes its config on its next tick.
+const FLIR_CONFIG_MAX: usize = 256;
+
+/// `ir.flir_config(r, g, b, black_hot, tmin, tmax)` - microcontroller only.
+///
+/// Sets the FLIR presentation of the camera whose video output feeds this
+/// microcontroller's video input, keyed by the camera component pointer - the
+/// key `flir.rs` reads from `FLIR_CONFIG` for the view it is compositing.
+/// Returns true when the link resolved and the config was stored, false (and a
+/// one-shot log line) otherwise. The link fields are only valid while the
+/// game's tick owns them, which is exactly when a script call runs, so they are
+/// read here and never cached.
+pub(crate) extern "C" fn ir_flir_config(lua: *mut c_void) -> i32 {
+    // A panic must never unwind through the Lua C function: the game aborts.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { flir_config_inner(lua) }))
+        .unwrap_or(0)
+}
+
+unsafe fn flir_config_inner(lua: *mut c_void) -> i32 {
+    let lua = lua as usize;
+    unsafe {
+        let config = match flir_config_args(lua) {
+            Ok(config) => config,
+            Err(reason) => return flir_config_failed(lua, reason),
+        };
+        let Some(component) = mc_component(lua) else {
+            return flir_config_failed(lua, NO_MC_STATE);
+        };
+        let Some((camera, source_node)) = mc_camera(component) else {
+            log_mc_failure(lua);
+            return flir_config_failed(lua, NO_CAMERA);
+        };
+
+        {
+            let mut configs = FLIR_CONFIG
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if configs.len() >= FLIR_CONFIG_MAX && !configs.contains_key(&camera) {
+                configs.clear();
+            }
+            let entry = configs.entry(camera).or_default();
+            *entry = FlirCfg {
+                enabled: entry.enabled,
+                enabled_ms: entry.enabled_ms,
+                ..config
+            };
+        }
+
+        // One-shot in-game validation of the inferred link walk: the first
+        // successful call proves which camera the MC is actually feeding.
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            log_line(&format!(
+                "ir.flir_config: camera={camera:#x} mc={component:#x} source_node={source_node:#x} \
+slot_vt={:#x} camera_vt={:#x} cfg=({:?}, black_hot={}, window=[{}, {}] C)",
+                read_usize_at(camera + CAMERA_VIDEO_SLOT),
+                read_usize_at(camera),
+                config.rgb,
+                config.black_hot,
+                config.tmin,
+                config.tmax
+            ));
+        }
+        lua_push_boolean(lua, true);
+    }
+    1
+}
+
+/// Parse and validate the six `ir.flir_config` arguments.
+unsafe fn flir_config_args(lua: usize) -> Result<FlirCfg, &'static str> {
+    let mut rgb = [0.0f32; 3];
+    for (index, slot) in rgb.iter_mut().enumerate() {
+        let Some(value) = lua_arg_number(lua, index as i32 + 1) else {
+            return Err("r, g and b must be numbers (0..1 tint)");
+        };
+        if !value.is_finite() {
+            return Err("r, g and b must be finite numbers");
+        }
+        *slot = value.clamp(0.0, 1.0) as f32;
+    }
+    let Some(black_hot) = lua_arg_bool(lua, 4) else {
+        return Err("black_hot must be a boolean or a number");
+    };
+    let (Some(tmin), Some(tmax)) = (lua_arg_number(lua, 5), lua_arg_number(lua, 6)) else {
+        return Err("tmin and tmax must be numbers (Celsius)");
+    };
+    if !tmin.is_finite() || !tmax.is_finite() {
+        return Err("tmin and tmax must be finite numbers");
+    }
+    // Convert first: an f64 beyond the f32 range becomes infinite, which the
+    // shader would then receive as a window edge.
+    let (tmin, tmax) = (tmin as f32, tmax as f32);
+    if !tmin.is_finite() || !tmax.is_finite() || !(tmin < tmax) {
+        return Err("tmin must be below tmax");
+    }
+    if tmax - tmin < FLIR_MIN_WINDOW_C {
+        return Err("the display window must be at least 0.01 C wide");
+    }
+    Ok(FlirCfg {
+        rgb,
+        black_hot,
+        tmin,
+        tmax,
+        ..FlirCfg::default()
+    })
+}
+
+/// Push `false` for a failed config call and log the reason once, so a script
+/// calling this every tick cannot flood the log before the camera is wired.
+fn flir_config_failed(lua: usize, reason: &str) -> i32 {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        log_line(&format!(
+            "ir.flir_config returned false: {reason} (only the first failure is logged)"
+        ));
+    }
+    unsafe { lua_push_boolean(lua, false) };
+    1
+}
+
+/// `ir.flir(on)` - microcontroller only. Enables FLIR for the camera feeding
+/// this MC's video input; must be called every tick (expires after 1 s).
+/// `false`/`0` disables immediately. Returns true if a camera was resolved.
+pub(crate) extern "C" fn ir_flir(lua: *mut c_void) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { flir_inner(lua) }))
+        .unwrap_or(0)
+}
+
+unsafe fn flir_inner(lua: *mut c_void) -> i32 {
+    let lua = lua as usize;
+    unsafe {
+        let resolved = (|| {
+            let on = lua_arg_bool(lua, 1)?;
+            let component = mc_component(lua)?;
+            let Some((camera, _)) = mc_camera(component) else {
+                log_mc_failure(lua);
+                return None;
+            };
+            Some((on, camera))
+        })();
+        let Some((on, camera)) = resolved else {
+            lua_push_boolean(lua, false);
+            return 1;
+        };
+        {
+            let mut configs = FLIR_CONFIG
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if configs.len() >= FLIR_CONFIG_MAX && !configs.contains_key(&camera) {
+                configs.clear();
+            }
+            let entry = configs.entry(camera).or_default();
+            entry.enabled = on;
+            entry.enabled_ms = crate::state::now_ms();
+        }
+        lua_push_boolean(lua, true);
+    }
+    1
+}
+
 // One heat source as seen by the IR sensor.
 pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
+    // A panic must never unwind through the Lua C function: the game aborts.
+    #[cfg(feature = "logging")]
+    let t0 = std::time::Instant::now();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { scan_inner(lua) }));
+    #[cfg(feature = "logging")]
+    crate::blocktemp::SCAN_COST.add(t0);
+    r
+        .unwrap_or(0)
+}
+
+unsafe fn scan_inner(lua: *mut c_void) -> i32 {
+    // Synchronous on the game thread: reuse readable() results within the scan
+    // (a no-op when the scene-tick scope is already active around the script).
+    let _regions = crate::memory::RegionCacheScope::new();
     let lua = lua as usize;
     unsafe {
         // Azimuth steering is clamped to the same 0.25-turn deflection the
@@ -310,10 +872,13 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
             let vcount = VARIANT_COUNT.load(Ordering::Relaxed).min(MAX_VARIANTS);
             let mut fires_holders = [0usize; MAX_VARIANTS + 1];
             let mut fires_n = 0usize;
+            // shortcut: the air at the seeker stands in for the air at each
+            // source and for the scene background; per-source air if it matters.
+            base_temp = base_ambient_at(origin) as f64;
             for i in 0..vcount {
                 let a = variant_args(i);
-                collect_ir_sources(a[0], &origin, range, &mut sources);
-                collect_volume_heat_sources(a[0], &origin, range, &mut sources);
+                collect_ir_sources(a[0], &origin, range, base_temp, &mut sources);
+                collect_volume_heat_sources(a[0], &origin, range, base_temp, &mut sources);
                 let h = a[3];
                 if h >= 0x10000 && !fires_holders[..fires_n].contains(&h) {
                     fires_holders[fires_n] = h;
@@ -329,9 +894,33 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                 collect_fire_sources(h, &origin, range, &mut sources);
             }
             collect_emitter_sources(&origin, range, &mut sources);
+            // A seeker sees contrast: only radiance above the background's, so
+            // something at or below the air temperature is invisible.
+            let l_bg = crate::ir::band_radiance_c(base_temp as f32);
+            for s in sources.iter_mut() {
+                let l = crate::ir::band_radiance_c(s.temp_c as f32);
+                s.flux *= if l > 0.0 { (1.0 - l_bg / l).max(0.0) } else { 0.0 };
+            }
+            let own_vehicle = crate::blocktemp::seeker_vehicle(component);
+            // The game's heat records carry no vehicle; drop the ones inside
+            // the seeker's own vehicle so it can't lock onto its own engine.
+            if let Some(vid) = own_vehicle {
+                let spheres = crate::blocktemp::vehicle_spheres(vid);
+                sources.retain(|s| {
+                    !spheres.iter().any(|(c, r)| {
+                        (s.x - c.0).powi(2) + (s.y - c.1).powi(2) + (s.z - c.2).powi(2) < (r + 0.5).powi(2)
+                    })
+                });
+            }
             add_sun_source(origin, &mut sources);
+            // Water is opaque to IR: a submerged seeker sees nothing, and
+            // nothing submerged is seen.
+            let sea = crate::blocktemp::SEA_LEVEL_IR_M;
+            if origin.1 < sea {
+                sources.clear();
+            }
+            sources.retain(|s| s.sky || s.y >= sea);
             source_count = sources.len();
-            base_temp = base_ambient_at(origin) as f64;
             for s in sources.iter_mut() {
                 project_source(s, origin, forward, right, up);
             }
@@ -349,6 +938,13 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                 let physics_ok = component != 0 && read_usize_at(component + 0x1d8) != 0;
                 if physics_ok {
                     sources.retain(|s| {
+                        // Out-of-cone sources are dropped below anyway; a
+                        // physics ray each was most of the scan's cost.
+                        let d = s.az - az_center;
+                        let daz = (d - TAU * (d / TAU).round()) * s.el.cos().max(0.2);
+                        if (daz * daz + (s.el - el_center).powi(2)).sqrt() > fov_rad * 0.5 {
+                            return true;
+                        }
                         let center_dist =
                             (origin.0 - s.x) * (origin.0 - s.x)
                                 + (origin.1 - s.y) * (origin.1 - s.y)
@@ -395,10 +991,11 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
             // target outside it leaves the errors at zero, so a missile whose
             // seeker is pointed away flies straight instead of being pulled
             // onto whatever heat source happens to be in front of the hull.
-            // Sky sources remain visible in the image, but never steer.
+            // The sun steers too: in the cone it outshines any target.
+            // Same rule as the original plugin: the single brightest source.
             let mut brightest_in_cone: Option<(f64, f64, f64)> = None;
             for s in &sources {
-                if s.sky || !s.flux.is_finite() || s.flux <= 0.0 {
+                if !s.flux.is_finite() || s.flux <= 0.0 {
                     continue;
                 }
                 let d = s.az - az_center;
@@ -416,6 +1013,43 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                 // pixel resolution (0.37 degrees is about 0.00103 turns).
                 az_error = daz / TAU;
                 el_error = del / TAU;
+            }
+            // Evidence for oscillation: any scan-to-scan error step over
+            // 0.0005 turns (0.18 deg), with every in-cone source behind it.
+            #[cfg(feature = "logging")]
+            {
+                static LAST_ERR: std::sync::Mutex<Option<std::collections::HashMap<u32, (f64, f64)>>> =
+                    std::sync::Mutex::new(None);
+                static LAST_STEP_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let mut g = LAST_ERR.lock().unwrap_or_else(|e| e.into_inner());
+                let m = g.get_or_insert_with(std::collections::HashMap::new);
+                if let Some(&(pa, pe)) = m.get(&seeker_id) {
+                    let step = (az_error - pa).abs().max((el_error - pe).abs());
+                    let now = crate::state::now_ms();
+                    if step > 0.0005 && now.saturating_sub(LAST_STEP_LOG.load(Ordering::Relaxed)) > 200 {
+                        LAST_STEP_LOG.store(now, Ordering::Relaxed);
+                        let list: Vec<String> = sources
+                            .iter()
+                            .filter(|s| {
+                                let d = s.az - az_center;
+                                let daz = d - TAU * (d / TAU).round();
+                                ((daz * s.el.cos().max(0.2)).powi(2) + (s.el - el_center).powi(2)).sqrt() <= fov_rad * 0.5
+                            })
+                            .map(|s| {
+                                let d = ((s.x - origin.0).powi(2) + (s.y - origin.1).powi(2) + (s.z - origin.2).powi(2)).sqrt();
+                                format!("[flux={:.4} T={:.0}C d={:.0}m r={:.2} az={:+.3} el={:+.3}{}]", s.flux, s.temp_c, d, s.r_eff,
+                                    s.az.to_degrees(), s.el.to_degrees(), if s.sky { " SKY" } else { "" })
+                            })
+                            .collect();
+                        log_line(&format!(
+                            "seeker {seeker_id}: error step ({:+.5},{:+.5}) -> ({:+.5},{:+.5}) turns steer=({:+.2},{:+.2}) deg own_vehicle={:?} in-cone: {}",
+                            pa, pe, az_error, el_error, az_center.to_degrees(), el_center.to_degrees(), own_vehicle, list.join(" ")
+                        ));
+                    }
+                }
+                if m.len() < 256 || m.contains_key(&seeker_id) {
+                    m.insert(seeker_id, (az_error, el_error));
+                }
             }
 
             // The configured FOV still gates the rendered image, detection
@@ -477,8 +1111,28 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
                     0.0
                 };
                 let glare = BLOOM_PEAK * (1.0 - (-excess).exp());
-                for row in 0..res_y {
-                    for col in 0..res_x {
+                // Only visit cells the source can reach: its disc (or the
+                // 1.2-cell point spill) and, when it blooms, the halo out to
+                // 3 radii, where it is below one 12-bit step.
+                let (mut rc, mut rr) = if solid <= cell_solid {
+                    (1.2, 1.2)
+                } else {
+                    (
+                        s.theta / (az_sp * s.el.cos().max(0.2)),
+                        s.theta / el_sp,
+                    )
+                };
+                if glare > 0.0 {
+                    rc = rc.max(3.0 * BLOOM_RADIUS_CELLS);
+                    rr = rr.max(3.0 * BLOOM_RADIUS_CELLS);
+                }
+                let span = |c: f64, r: f64, n: i32| {
+                    ((c - r).floor().max(0.0) as i32, ((c + r).ceil() as i32).min(n - 1))
+                };
+                let (c0, c1) = span(col_f, rc, res_x);
+                let (r0, r1) = span(row_f, rr, res_y);
+                for row in r0..=r1 {
+                    for col in c0..=c1 {
                         let dc = col_f - col as f64;
                         let dr = row_f - row as f64;
                         let d_cells = (dc * dc + dr * dr).sqrt();
@@ -577,6 +1231,19 @@ pub(crate) extern "C" fn ir_scan(lua: *mut c_void) -> i32 {
         // Verbose diagnostics only exist in the logging build; the player build
         // compiles this whole block out, so a long session leaves a log with a
         // handful of lines instead of megabytes of scan dumps.
+        // Per-scan error trace while something is tracked: PN guidance
+        // differentiates the line of sight every tick, so tick-to-tick
+        // jitter is what matters and the 1-in-300 dump can't show it.
+        #[cfg(feature = "logging")]
+        if strength > 0.0 {
+            static TRACE_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if TRACE_LINES.fetch_add(1, Ordering::Relaxed) < 6000 {
+                log_line(&format!(
+                    "trace seeker {seeker_id}: err=({:+.6},{:+.6}) turns flux={:.5} n={}",
+                    az_error, el_error, total_flux, source_count
+                ));
+            }
+        }
         #[cfg(feature = "logging")]
         if scan_index % 300 == 0 {
             {
@@ -789,6 +1456,7 @@ error=({:+.6},{:+.6}) turns centroid wx/ws={:.4} wy/ws={:.4} cells_lit={} peak={
     }
     8
 }
+
 
 // ---------------------------------------------------------------------------
 // vector / matrix helpers

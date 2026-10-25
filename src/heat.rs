@@ -1,15 +1,17 @@
-//! The game's heat model: the heat container variants seen by the hooked
-//! temperature function, the per-record influence falloff, and the ambient
-//! base temperature. Also the verbose container dumps.
+//! The game's heat model: the world root the temperature evaluators are called
+//! with, the point temperature and the ambient base. Also the verbose container
+//! dumps.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::ir::Vec3;
-#[cfg(feature = "logging")]
 use crate::logging::log_line;
-use crate::memory::{game_fn, read_f32_at, read_f64_at, read_u32_at, read_usize_at};
+use crate::memory::{
+    game_fn, in_game_image, read_u32_at, read_usize_at, readable, writable, PTR_MIN,
+};
+// Used by the verbose container dumps only.
 #[cfg(feature = "logging")]
-use crate::memory::readable;
+use crate::memory::{read_f32_at, read_f64_at, PTR_MAX};
 use crate::offsets::*;
 use crate::state::*;
 
@@ -24,7 +26,7 @@ pub(crate) unsafe fn log_heat_container(c: usize) {
     // c can be a stale captured hook argument and every pointer below is
     // game-controlled, so EVERY dereference must be readable()-guarded. A
     // range check alone passes on any garbage pointer inside userland.
-    if c < 0x10000 || !readable(c, 0x34) {
+    if c < PTR_MIN || !readable(c, 0x34) {
         log_line("heat container: NULL or unreadable");
         return;
     }
@@ -36,7 +38,7 @@ pub(crate) unsafe fn log_heat_container(c: usize) {
         "heat container {:#x}: slots={:#x} cap={} start={} count={}",
         c, slots, cap, start, count
     ));
-    if slots < 0x10000 || cap == 0 || count == 0 {
+    if slots < PTR_MIN || cap == 0 || count == 0 {
         return;
     }
     let dump = count.min(32);
@@ -46,11 +48,11 @@ pub(crate) unsafe fn log_heat_container(c: usize) {
             continue;
         }
         let holder = read_usize_at(slots + idx * 8);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&holder) || !readable(holder, 8) {
+        if !(PTR_MIN..PTR_MAX).contains(&holder) || !readable(holder, 8) {
             continue;
         }
         let rec = read_usize_at(holder);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&rec) || !readable(rec, 0x128) {
+        if !(PTR_MIN..PTR_MAX).contains(&rec) || !readable(rec, 0x128) {
             continue;
         }
         let mode = *(rec as *const u8);
@@ -110,134 +112,162 @@ pub(crate) fn variant_args(i: usize) -> [usize; 8] {
     a
 }
 
-/// Heat-source influence at a point, replicated from `FUN_14030bd10` so the
-/// scan does not depend on calling that function directly:
-///   sphere: t = (dist(center,+0x68..) - radius(+0x108)) / (T(+0x118) * 0.125)
-///   box:    t = max(0, axis dist - extent/2) / (T * 0.125)
-///   return: (1 - clamp(t)) * factor(+0x114)
-#[inline]
-pub(crate) unsafe fn influence_at(rec: usize, px: f64, py: f64, pz: f64) -> f32 {
-    let factor = read_f32_at(rec + 0x114);
-    let temp = read_f32_at(rec + 0x118);
-    if factor <= 0.0 || temp <= 0.0 {
-        return 0.0;
+// ---------------------------------------------------------------------------
+// World root
+// ---------------------------------------------------------------------------
+
+// Offsets of the world fields the game's temperature evaluators receive as
+// arguments. The root itself is recovered once (through one of them, or from
+// the scene the hooks cache) and re-validated on every use, so a call-scoped
+// hook argument can never become a cached call argument again.
+const WORLD_HEAT_FIELD: usize = 0xbaef0;
+const WORLD_WIND_FIELD: usize = 0x68a0;
+const WORLD_WEATHER: usize = 0xbade8;
+const WORLD_ENV_LIST: usize = 0x4ce0;
+const WORLD_PROVIDER: usize = 0x4988;
+
+/// Water flag the game's callers pass for a craft/interior position (1), which
+/// is where a seeker camera or a vehicle body always sits.
+const EVAL_WATER_FLAG: u8 = 1;
+
+/// Returned while no validated world root exists (menu, level load/teardown).
+pub(crate) const WORLD_FALLBACK_C: f32 = 20.0;
+
+static WORLD_ROOT: AtomicUsize = AtomicUsize::new(0);
+static WORLD_LOGGED: AtomicBool = AtomicBool::new(false);
+static WORLD_FAIL_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Validate a world root: the weather grid header, the heat field and the wind
+/// field are the structures both evaluators dereference through it. A torn-down
+/// world must fail this instead of being called.
+unsafe fn world_ok(world: usize) -> bool {
+    // Userland, 8-aligned, and low enough that every offset below cannot wrap.
+    if !(PTR_MIN..0x8000_0000_0000).contains(&world) || world & 7 != 0 {
+        return false;
     }
-    let denom = temp * 0.125;
-    let mode = *(rec as *const u8);
-    let t = if mode != 0 {
-        let a = ((px * read_f64_at(rec + 0x88)
-            + py * read_f64_at(rec + 0xa8)
-            + pz * read_f64_at(rec + 0xc8)
-            + read_f64_at(rec + 0xe8))
-            .abs() as f32
-            - read_f32_at(rec + 0x108) * 0.5)
-            .max(0.0);
-        let b = ((px * read_f64_at(rec + 0x90)
-            + py * read_f64_at(rec + 0xb0)
-            + pz * read_f64_at(rec + 0xd0)
-            + read_f64_at(rec + 0xf0))
-            .abs() as f32
-            - read_f32_at(rec + 0x10c) * 0.5)
-            .max(0.0);
-        let c = ((px * read_f64_at(rec + 0x98)
-            + py * read_f64_at(rec + 0xb8)
-            + pz * read_f64_at(rec + 0xd8)
-            + read_f64_at(rec + 0xf8))
-            .abs() as f32
-            - read_f32_at(rec + 0x110) * 0.5)
-            .max(0.0);
-        a.max(b).max(c) / denom
+    if !readable(world + WORLD_WEATHER, 0xb8)
+        || !readable(world + WORLD_HEAT_FIELD, 8)
+        || !readable(world + WORLD_WIND_FIELD, 8)
+    {
+        return false;
+    }
+    // Weather grid: uint16 cell count at +6 (air/sea cell tables at +0/+0x28 and
+    // the height range at +0xb0/+0xb4, docs/RE_NOTES.md §3.1). The neighbouring
+    // pointer fields are cell DATA addresses inside the grid, not userland
+    // pointers: they are only ever dereferenced by the evaluator itself, so
+    // validating them here would reject every real world.
+    if ((read_u32_at(world + WORLD_WEATHER + 4) >> 16) as u16) < 2 {
+        return false;
+    }
+    read_usize_at(world + WORLD_HEAT_FIELD) != 0
+}
+
+/// The validated world root, or `None` while the game has none. Cached once,
+/// but re-derived whenever the cached value stops validating so a level reload
+/// does not leave every probe on the fallback.
+///
+/// The cached scene pointer is preferred: the scene tick and the render uniform
+/// fill both hand it over every frame, so it is the freshest copy of the same
+/// object the evaluator's arguments point at.
+/// Drop the cached world root (the scene object changed: world load/unload).
+pub(crate) fn forget_world() {
+    WORLD_ROOT.store(0, Ordering::Relaxed);
+}
+
+pub(crate) unsafe fn world() -> Option<usize> {
+    let cached = WORLD_ROOT.load(Ordering::Relaxed);
+    let live = SCENE.load(Ordering::Relaxed);
+    if cached != 0 {
+        // A freed scene from the previous world can stay readable and pass
+        // world_ok; the scene tick's current object is the authority.
+        if (live == 0 || live == cached) && world_ok(cached) {
+            return Some(cached);
+        }
+        WORLD_ROOT.store(0, Ordering::Relaxed);
+    }
+    let scene = SCENE.load(Ordering::Relaxed);
+    let found = if scene != 0 && world_ok(scene) {
+        Some((scene, "cached scene"))
     } else {
-        let dx = px - read_f64_at(rec + 0x68);
-        let dy = py - read_f64_at(rec + 0x70);
-        let dz = pz - read_f64_at(rec + 0x78);
-        let dist = ((dx * dx + dy * dy + dz * dz).sqrt()) as f32;
-        (dist - read_f32_at(rec + 0x108)) / denom
+        // Recover the root from one of the evaluator's own arguments (cached by
+        // the temperature hook, never used as call arguments any more).
+        let args = variant_args(0);
+        let mut hit = None;
+        for (index, field, name) in [
+            (0usize, WORLD_HEAT_FIELD, "temperature arg2 - 0xbaef0"),
+            (1, WORLD_WIND_FIELD, "temperature arg3 - 0x68a0"),
+            (2, WORLD_WEATHER, "temperature arg4 - 0xbade8"),
+            (3, WORLD_ENV_LIST, "temperature arg5 - 0x4ce0"),
+            (5, WORLD_PROVIDER, "temperature arg7 - 0x4988"),
+        ] {
+            if args[index] >= field + PTR_MIN && world_ok(args[index] - field) {
+                hit = Some((args[index] - field, name));
+                break;
+            }
+        }
+        hit
     };
-    (1.0 - t.clamp(0.0, 1.0)) * factor
+    let Some((world, source)) = found else {
+        // A failed validation must never be silent: without a root every probe
+        // is the fixed fallback, which otherwise looks like a broken sim.
+        if !WORLD_FAIL_LOGGED.swap(true, Ordering::Relaxed) {
+            log_line(&format!(
+                "world root not found (scene={scene:#x}); temperature probes report the {WORLD_FALLBACK_C} C fallback"
+            ));
+        }
+        return None;
+    };
+    WORLD_ROOT.store(world, Ordering::Relaxed);
+    if !WORLD_LOGGED.swap(true, Ordering::Relaxed) {
+        log_line(&format!(
+            "world root {world:#x} from {source} (scene={scene:#x} same={})",
+            world == scene
+        ));
+    }
+    Some(world)
 }
 
-/// Max heat contribution over every record in one container, ignoring the
-/// per-owner filter: `influence(record, point) * record.temperature`.
-pub(crate) unsafe fn max_heat_in_container(c: usize, px: f64, py: f64, pz: f64) -> f32 {
-    if c < 0x10000 {
-        return 0.0;
+/// Out parameter of [`fake_provider_get`]: the evaluator hands the provider its
+/// output pointer in RDX. The call site has no guard at all, so nothing here may
+/// fault: return 0 C as well, and write only into memory proven writable.
+unsafe extern "win64" fn fake_provider_get(_this: usize, out: usize, _unused: usize) -> f32 {
+    if writable(out, 4) {
+        *(out as *mut f32) = 0.0;
     }
-    let slots = read_usize_at(c + 0x20);
-    let cap = read_u32_at(c + 0x28) as usize;
-    let start = read_u32_at(c + 0x2c) as usize;
-    let count = read_u32_at(c + 0x30) as usize;
-    if slots < 0x10000 || cap == 0 || count == 0 {
-        return 0.0;
+    0.0
+}
+
+// A stand-in for the vehicle air-volume provider: the evaluator reads the
+// provided temperature through vtable slot +0x28 (index 5) only, so a slot that
+// reports 0 C ("no room air volume here") reproduces the caller's behaviour.
+// Atomic cells rather than statics with pointer initialisers: a static cannot.
+static FAKE_PROVIDER_VT: [AtomicUsize; 6] = [const { AtomicUsize::new(0) }; 6];
+static FAKE_PROVIDER: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+
+fn fake_provider() -> usize {
+    if FAKE_PROVIDER[0].load(Ordering::Relaxed) == 0 {
+        FAKE_PROVIDER_VT[5].store(
+            fake_provider_get as unsafe extern "win64" fn(usize, usize, usize) -> f32 as usize,
+            Ordering::Relaxed,
+        );
+        FAKE_PROVIDER[0].store(FAKE_PROVIDER_VT.as_ptr() as usize, Ordering::Relaxed);
     }
-    let mut best = 0.0f32;
-    for i in 0..count {
-        let idx = (start + i) % cap;
-        let holder = read_usize_at(slots + idx * 8);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&holder) {
-            continue;
-        }
-        let rec = read_usize_at(holder);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&rec) {
-            continue;
-        }
-        let influence = influence_at(rec, px, py, pz);
-        if influence > 0.0 {
-            let contrib = influence * read_f32_at(rec + 0x118);
-            if contrib > best {
-                best = contrib;
+    FAKE_PROVIDER.as_ptr() as usize
+}
+
+/// The game's own provider object, but only when both its vtable and the slot
+/// the evaluator calls are game image memory; otherwise the static stand-in.
+unsafe fn provider_object(world: usize) -> usize {
+    let provider = world + WORLD_PROVIDER;
+    if readable(provider, 8) {
+        let vtable = read_usize_at(provider);
+        if in_game_image(vtable) && readable(vtable + 0x28, 8) {
+            if in_game_image(read_usize_at(vtable + 0x28)) {
+                return provider;
             }
         }
     }
-    best
-}
-
-pub(crate) unsafe fn temperature_at(x: f64, y: f64, z: f64) -> f32 {
-    if !TEMP_READY.load(Ordering::SeqCst) {
-        return 20.0;
-    }
-    let point = [x, y, z];
-    let pptr = point.as_ptr() as usize;
-
-    // The game's own function, for fires / lava / its exact blend.
-    let mut best = 20.0f32;
-    let original = ORIG_TEMPERATURE.load(Ordering::SeqCst);
-    let count = VARIANT_COUNT.load(Ordering::Relaxed).min(MAX_VARIANTS);
-    if original != 0 && count > 0 {
-        let f: unsafe extern "C" fn(
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-        ) -> f32 = std::mem::transmute(original);
-        let a = variant_args(0);
-        best = f(pptr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
-    }
-
-    if count > 0 {
-        let base_fn: unsafe extern "C" fn(usize, usize, usize, usize, u8) -> f32 =
-            game_fn(RVA_BASE_TEMP);
-        let a0 = variant_args(0);
-        let base = base_fn(pptr, a0[1], a0[2], a0[2], a0[6] as u8);
-        let mut heat = 0.0f32;
-        for i in 0..count {
-            let a = variant_args(i);
-            let h = max_heat_in_container(a[0], x, y, z);
-            if h > heat {
-                heat = h;
-            }
-        }
-        let combined = base + heat;
-        if combined > best {
-            best = combined;
-        }
-    }
-    best
+    fake_provider()
 }
 
 // ---------------------------------------------------------------------------
@@ -245,24 +275,76 @@ pub(crate) unsafe fn temperature_at(x: f64, y: f64, z: f64) -> f32 {
 // ---------------------------------------------------------------------------
 
 /// Base ambient temperature at a world point (no heat sources added).
+///
+/// `ambient_temp_at_pos(pos, windField, weatherGrid, ignored, waterFlag)`: a4 is
+/// dead in the callee (only its home slot is used as scratch), so it gets a
+/// local buffer instead of a cached object.
 pub(crate) unsafe fn base_ambient_at(origin: Vec3) -> f32 {
-    if !TEMP_READY.load(Ordering::SeqCst) {
-        return 20.0;
-    }
-    if VARIANT_COUNT.load(Ordering::Relaxed) == 0 {
-        return 20.0;
-    }
-    let a0 = variant_args(0);
-    let base_fn: unsafe extern "C" fn(usize, usize, usize, usize, u8) -> f32 =
+    let Some(world) = world() else {
+        return WORLD_FALLBACK_C;
+    };
+    base_ambient_in(world, origin)
+}
+
+/// [`base_ambient_at`] for a caller that already holds a validated world root.
+unsafe fn base_ambient_in(world: usize, origin: Vec3) -> f32 {
+    let pos = [origin.0, origin.1, origin.2, 0.0f64];
+    let mut scratch = 0u64;
+    let ambient_fn: unsafe extern "C" fn(usize, usize, usize, usize, u8) -> f32 =
         game_fn(RVA_BASE_TEMP);
-    let point = [origin.0, origin.1, origin.2];
-    base_fn(
-        point.as_ptr() as usize,
-        a0[1],
-        a0[2],
-        a0[2],
-        a0[6] as u8,
-    )
+    let value = ambient_fn(
+        pos.as_ptr() as usize,
+        world + WORLD_WIND_FIELD,
+        world + WORLD_WEATHER,
+        &mut scratch as *mut u64 as usize,
+        EVAL_WATER_FLAG,
+    );
+    if value.is_finite() {
+        value
+    } else {
+        WORLD_FALLBACK_C
+    }
+}
+
+pub(crate) unsafe fn temperature_at(x: f64, y: f64, z: f64) -> f32 {
+    crate::fault::set(crate::fault::stage::HEAT_TEMPERATURE_AT);
+    let Some(world) = world() else {
+        return WORLD_FALLBACK_C;
+    };
+    let pos = [x, y, z, 0.0f64];
+    let pptr = pos.as_ptr() as usize;
+
+    // The game's own evaluator (fires, lava, hot objects, the vehicle air-volume
+    // provider), with every argument rebuilt from the validated world root:
+    //   temperature_eval_at_pos(pos, heat, wind, weather, envList, unused,
+    //                           provider, waterFlag, airVolume)
+    let original = ORIG_TEMPERATURE.load(Ordering::SeqCst);
+    let eval = if original != 0 {
+        original
+    } else {
+        game_fn::<usize>(RVA_TEMPERATURE)
+    };
+    if eval == 0 {
+        return WORLD_FALLBACK_C;
+    }
+    let f: unsafe extern "C" fn(usize, usize, usize, usize, usize, usize, usize, u8, usize) -> f32 =
+        std::mem::transmute(eval);
+    let value = f(
+        pptr,
+        world + WORLD_HEAT_FIELD,
+        world + WORLD_WIND_FIELD,
+        world + WORLD_WEATHER,
+        world + WORLD_ENV_LIST,
+        0,
+        provider_object(world),
+        EVAL_WATER_FLAG,
+        0,
+    );
+    if value.is_finite() {
+        value
+    } else {
+        WORLD_FALLBACK_C
+    }
 }
 
 /// Diagnostic dump of the fires container (logging builds only).
@@ -271,7 +353,7 @@ pub(crate) unsafe fn log_fires_container(c: usize) {
     if DEEP_DUMP_DISABLED.load(Ordering::Relaxed) {
         return;
     }
-    if c < 0x10000 || !readable(c, 0x11ec) {
+    if c < PTR_MIN || !readable(c, 0x11ec) {
         log_line("fires container: NULL or unreadable");
         return;
     }
@@ -283,7 +365,7 @@ pub(crate) unsafe fn log_fires_container(c: usize) {
         "fires container {:#x}: slots={:#x} cap={} start={} count={}",
         c, slots, cap, start, count
     ));
-    if slots < 0x10000 || cap == 0 || count == 0 {
+    if slots < PTR_MIN || cap == 0 || count == 0 {
         return;
     }
     let dump = (count as usize).min(4);
@@ -293,7 +375,7 @@ pub(crate) unsafe fn log_fires_container(c: usize) {
             continue;
         }
         let group = read_usize_at(slots + idx * 8);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&group) || !readable(group, 0x98) {
+        if !(PTR_MIN..PTR_MAX).contains(&group) || !readable(group, 0x98) {
             continue;
         }
         let x = read_f64_at(group + 0x38);
@@ -313,7 +395,7 @@ pub(crate) unsafe fn log_volume_heat_sources(c: usize) {
     if DEEP_DUMP_DISABLED.load(Ordering::Relaxed) {
         return;
     }
-    if c < 0x10000 || !readable(c, 0x1c) {
+    if c < PTR_MIN || !readable(c, 0x1c) {
         return;
     }
     let slots = read_usize_at(c + 0x8);
@@ -324,7 +406,7 @@ pub(crate) unsafe fn log_volume_heat_sources(c: usize) {
         "volume-heat container {:#x}: slots={:#x} cap={} start={} count={}",
         c, slots, cap, start, count
     ));
-    if slots < 0x10000 || cap == 0 || count == 0 {
+    if slots < PTR_MIN || cap == 0 || count == 0 {
         return;
     }
     let dump = (count as usize).min(6);
@@ -334,11 +416,11 @@ pub(crate) unsafe fn log_volume_heat_sources(c: usize) {
             continue;
         }
         let holder = read_usize_at(slots + idx * 8);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&holder) || !readable(holder, 8) {
+        if !(PTR_MIN..PTR_MAX).contains(&holder) || !readable(holder, 8) {
             continue;
         }
         let rec = read_usize_at(holder);
-        if !(0x10000..0x7fff_ffff_ffff).contains(&rec) || !readable(rec, 0x58) {
+        if !(PTR_MIN..PTR_MAX).contains(&rec) || !readable(rec, 0x58) {
             continue;
         }
         log_line(&format!(

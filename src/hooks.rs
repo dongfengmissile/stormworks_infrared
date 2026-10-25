@@ -4,16 +4,20 @@
 //! gate that refuses to install when the game build changed.
 
 use std::ffi::c_void;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use minhook::MinHook;
 
 use crate::api::{register_ir_screen_table, register_ir_table};
-use crate::heat::cache_variant;
+use crate::heat::{base_ambient_at, cache_variant, WORLD_FALLBACK_C};
 #[cfg(feature = "logging")]
 use crate::heat::{log_fires_container, log_heat_container, log_volume_heat_sources};
-use crate::logging::log_line;
-use crate::memory::{bytes_match, read_f32_at, read_f64_at, read_u32_at, read_usize_at, readable};
+use crate::logging::{log_line, log_once};
+use crate::memory::{
+    bytes_match, in_game_image, read_f32_at, read_f64_at, read_u32_at, read_usize_at, readable,
+    PTR_MAX, PTR_MIN,
+};
 use crate::offsets::*;
 #[cfg(feature = "logging")]
 use crate::sources::read_pstr;
@@ -26,7 +30,8 @@ pub(crate) extern "C" fn ir_registrar_hook(context: usize) {
         let f: unsafe extern "C" fn(usize) = unsafe { std::mem::transmute(original) };
         unsafe { f(context) };
     }
-    unsafe { register_ir_table(context) };
+    // A panic must never unwind through a detour: the game would abort.
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe { register_ir_table(context) }));
     REGISTRAR_HITS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -43,7 +48,7 @@ pub(crate) extern "C" fn ir_screen_init_hook(state: usize) {
         let f: unsafe extern "C" fn(usize) = unsafe { std::mem::transmute(original) };
         unsafe { f(state) };
     }
-    unsafe { register_ir_screen_table(state) };
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe { register_ir_screen_table(state) }));
     SCREEN_INIT_HITS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -70,8 +75,8 @@ extern "C" fn ir_exhaust_update_hook(
     p9: usize,
     p10: usize,
     p11: usize,
-) {
-    unsafe {
+) -> f32 {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         if readable(emitter, 0x18) {
             let definition = read_usize_at(emitter);
             if definition >= 0x10000 && readable(definition, 0x68) {
@@ -150,6 +155,14 @@ extern "C" fn ir_exhaust_update_hook(
                                         ENGINE_DEFAULT_SIZE_M,
                                     );
                                 } else if pending.len() < EMITTER_MAX_PENDING {
+                                    if let Ok(mut keys) = EXHAUST_EMITTERS.lock() {
+                                        if !keys.contains(&emitter) {
+                                            if keys.len() >= 256 {
+                                                keys.remove(0);
+                                            }
+                                            keys.push(emitter);
+                                        }
+                                    }
                                     pending.push((
                                         emitter,
                                         now_ms(),
@@ -167,14 +180,44 @@ extern "C" fn ir_exhaust_update_hook(
                 }
             }
         }
+    }));
+    unsafe {
         let original = ORIG_EXHAUST_UPDATE.load(Ordering::SeqCst);
         if original == 0 {
-            return;
+            return 0.0;
         }
+        // Returns float (emitter+0x50 spawn accumulator) in xmm0.
         let f: unsafe extern "C" fn(
             usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize,
-        ) = std::mem::transmute(original);
-        f(emitter, position, p3, p4, rate_ptr, p6, p7, p8, p9, p10, p11);
+        ) -> f32 = std::mem::transmute(original);
+        f(emitter, position, p3, p4, rate_ptr, p6, p7, p8, p9, p10, p11)
+    }
+}
+
+/// Sanity cap on a radiator's +0x240 temperature (coolant boils well below it).
+const FLUID_MAX_PLAUSIBLE_C: f64 = 150.0;
+
+/// Definition (comp+0x58): type u32 at +0x2AC and water_component_type u32 at +0xECC
+/// (written by tile_definition_parse 0x3168D0 at 0x316AD4 / 0x317CB5).
+const DEF_TYPE_OFFSET: usize = 0x2ac;
+const DEF_WATER_TYPE_OFFSET: usize = 0xecc;
+const DEF_TYPE_FLUID: u32 = 24;
+/// water_component_type of radiators/heat sinks (9), liquid-liquid (16), air-air (17)
+/// and air-liquid (18) heat exchangers, per rom/data/definitions.
+const HEAT_EMITTING_WATER_TYPES: [u32; 4] = [9, 16, 17, 18];
+
+/// Fluid part whose definition is a radiator, heat sink or heat exchanger.
+unsafe fn is_heat_emitting_fluid(component: usize) -> bool {
+    unsafe {
+        if !readable(component + 0x58, 8) {
+            return false;
+        }
+        let def = read_usize_at(component + 0x58);
+        if def & 7 != 0 || !readable(def + DEF_TYPE_OFFSET, 4) || !readable(def + DEF_WATER_TYPE_OFFSET, 4) {
+            return false;
+        }
+        read_u32_at(def + DEF_TYPE_OFFSET) == DEF_TYPE_FLUID
+            && HEAT_EMITTING_WATER_TYPES.contains(&read_u32_at(def + DEF_WATER_TYPE_OFFSET))
     }
 }
 
@@ -612,6 +655,13 @@ unsafe fn class_tick_probe(
     matrix: usize,
     origin: usize,
 ) {
+    calls.fetch_add(1, Ordering::Relaxed);
+    // Diagnostics only (samples feed the opt-in deep dump): every pipe and tank
+    // runs this per tick, so skip the reads, lock and position math unless the
+    // deep dump is enabled.
+    if DEEP_DUMP_DISABLED.load(Ordering::Relaxed) {
+        return;
+    }
     if !readable(component, 0x40) {
         note_rejection(&format!("{family} component not readable this={component:#x}"));
         return;
@@ -636,7 +686,6 @@ unsafe fn class_tick_probe(
             && !(*x == 0.0 && *y == 0.0 && *z == 0.0)
     });
     let size_m = component_size_m(component);
-    calls.fetch_add(1, Ordering::Relaxed);
     #[cfg(feature = "logging")]
     let _ = record_engine_sample(component, family, 0.0, 0.0, position, size_m);
     #[cfg(not(feature = "logging"))]
@@ -677,8 +726,16 @@ extern "C" fn ir_preset_tick_hook(
     p14: usize,
     p15: usize,
     p16: usize,
+    p17: usize,
+    p18: usize,
+    p19: usize,
+    p20: usize,
+    p21: usize,
+    p22: usize,
+    p23: usize,
+    p24: usize,
 ) -> usize {
-    unsafe {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         note_hook_call("preset", component);
         class_tick_probe(component, &PRESET_TICK_CALLS, "preset", p5, p6);
         if readable(component, PRESET_TEMP_OFFSET + 4) && looks_like_component(component) {
@@ -694,16 +751,20 @@ extern "C" fn ir_preset_tick_hook(
             };
             publish_engine_source(component, position, power, temperature, size_m);
         }
+    }));
+    unsafe {
         let original = ORIG_PRESET_TICK.load(Ordering::SeqCst);
         if original == 0 {
             return 0;
         }
         let f: unsafe extern "C" fn(
             usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize,
-            usize, usize, usize, usize,
+            usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize,
         ) -> usize = std::mem::transmute(original);
+        // 24 args (the tail is read by the callee; steam uses a23 as a container) - forward all.
         f(
-            component, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16,
+            component, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17,
+            p18, p19, p20, p21, p22, p23, p24,
         )
     }
 }
@@ -729,7 +790,7 @@ extern "C" fn ir_modular_tick_hook(
     p15: usize,
     p16: usize,
 ) -> usize {
-    unsafe {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         note_hook_call("custom", component);
         class_tick_probe(component, &MODULAR_TICK_CALLS, "custom", p5, p6);
         if readable(component, MODULAR_TEMP_OFFSET + 4) && looks_like_component(component) {
@@ -744,6 +805,8 @@ extern "C" fn ir_modular_tick_hook(
             };
             publish_engine_source(component, position, power, temperature, size_m);
         }
+    }));
+    unsafe {
         let original = ORIG_MODULAR_TICK.load(Ordering::SeqCst);
         if original == 0 {
             return 0;
@@ -779,31 +842,49 @@ extern "C" fn ir_water_tick_hook(
     p14: usize,
     p15: usize,
     p16: usize,
-) -> usize {
-    unsafe {
+    p17: usize,
+    p18: usize,
+    p19: usize,
+    p20: usize,
+    p21: usize,
+    p22: usize,
+    p23: usize,
+    p24: usize,
+) -> f64 {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         note_hook_call("fluid", component);
         class_tick_probe(component, &WATER_TICK_CALLS, "fluid", p5, p6);
-        if readable(component, FLUID_TEMP_OFFSET + 4) && looks_like_component(component) {
+        // Only radiators/heat sinks/heat exchangers emit: +0x240 read 145-320 C on cold fuel
+        // tanks, so it is not a temperature on other fluid parts. Picked by definition data
+        // (type 24 + water_component_type), so modded parts that copy those attributes count.
+        if readable(component, FLUID_TEMP_OFFSET + 4)
+            && looks_like_component(component)
+            && is_heat_emitting_fluid(component)
+        {
             let temperature = read_f32_at(component + FLUID_TEMP_OFFSET) as f64;
-            let size_m = component_size_m(component);
-            let position = component_world_position(component, p5, p6);
-            let power = if temperature >= ENGINE_MIN_TEMP_C {
+            let power = if (ENGINE_MIN_TEMP_C..=FLUID_MAX_PLAUSIBLE_C).contains(&temperature) {
                 1.0
             } else {
                 0.0
             };
+            let size_m = component_size_m(component);
+            let position = component_world_position(component, p5, p6);
             publish_engine_source(component, position, power, temperature, size_m);
         }
+    }));
+    unsafe {
         let original = ORIG_WATER_TICK.load(Ordering::SeqCst);
         if original == 0 {
-            return 0;
+            return 0.0;
         }
         let f: unsafe extern "C" fn(
             usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize,
-            usize, usize, usize, usize,
-        ) -> usize = std::mem::transmute(original);
+            usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize,
+        ) -> f64 = std::mem::transmute(original);
+        // 24 args (the tail is read by the callee; steam uses a23 as a container) - forward all.
         f(
-            component, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16,
+            component, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17,
+            p18, p19, p20, p21, p22, p23, p24,
         )
     }
 }
@@ -827,20 +908,32 @@ extern "C" fn ir_steam_tick_hook(
     p14: usize,
     p15: usize,
     p16: usize,
-) -> usize {
-    unsafe {
+    p17: usize,
+    p18: usize,
+    p19: usize,
+    p20: usize,
+    p21: usize,
+    p22: usize,
+    p23: usize,
+    p24: usize,
+) -> f64 {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         note_hook_call("steam", component);
         class_tick_probe(component, &STEAM_TICK_CALLS, "steam", p5, p6);
+    }));
+    unsafe {
         let original = ORIG_STEAM_TICK.load(Ordering::SeqCst);
         if original == 0 {
-            return 0;
+            return 0.0;
         }
         let f: unsafe extern "C" fn(
             usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize,
-            usize, usize, usize, usize,
-        ) -> usize = std::mem::transmute(original);
+            usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize,
+        ) -> f64 = std::mem::transmute(original);
+        // 24 args (the tail is read by the callee; steam uses a23 as a container) - forward all.
         f(
-            component, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16,
+            component, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17,
+            p18, p19, p20, p21, p22, p23, p24,
         )
     }
 }
@@ -866,7 +959,7 @@ extern "C" fn ir_rocket_tick_hook(
     scene: usize,
     p16: usize,
 ) {
-    unsafe {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         if readable(component, 0x860) && looks_like_component(component) {
             // The tick only runs its burn block when the byte at +0x1d0 is set;
             // otherwise +0x778 keeps its previous value, so an idle rocket must
@@ -949,6 +1042,8 @@ def={definition:#x} sub={subtype} flags={} pos={position:?}",
                 size_m,
             );
         }
+    }));
+    unsafe {
         let original = ORIG_ROCKET_TICK.load(Ordering::SeqCst);
         if original == 0 {
             return;
@@ -990,7 +1085,7 @@ extern "C" fn ir_jet_tick_hook(
     scene: usize,
     p16: usize,
 ) {
-    unsafe {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         if readable(component, 0x1dc) && looks_like_component(component) {
             // +0x1bc is the spool speed: every turbine adds to it and the
             // extracted power is proportional to it.
@@ -1107,6 +1202,8 @@ extern "C" fn ir_jet_tick_hook(
             }
             publish_engine_source(component, position, activity, ir_temp_c, size_m);
         }
+    }));
+    unsafe {
         let original = ORIG_JET_TICK.load(Ordering::SeqCst);
         if original == 0 {
             return;
@@ -1121,6 +1218,58 @@ extern "C" fn ir_jet_tick_hook(
     }
 }
 
+/// One-shot verbose key: `hooks` owns bits 22..32 of the shared word
+/// (`blocktemp` owns 0..8, `flir` 8..22).
+const LOG_TEMPERATURE_PROVIDER: u32 = 1 << 22;
+
+/// True when `p7` — argument 7 of the temperature evaluator, the vehicle
+/// air-volume provider — is a game object the evaluator can call.
+///
+/// The original DOES NOT check it: after the heat/wind loops it does
+/// `mov rcx,[provider]` / `mov rax,[rcx]` / `call [rax+0x28]` at 0x30FFE1..0x31001A
+/// with no test, so any non-object (the observed bug is a stray 32-bit `-1`
+/// landing in the provider slot, giving `0xFFFFFFFFFFFFFFFF`) faults the game
+/// thread inside the call. Both the vtable and the called slot must be game
+/// image memory, or the call through them is not ours to make.
+///
+/// Deliberately cheap (this hook runs for every temperature probe): one region
+/// query on the object, then the image-range checks. `in_game_image` proves
+/// committed image memory, so the vtable's `+0x28` read needs no own check.
+#[inline]
+fn temperature_provider_ok(p7: usize) -> bool {
+    if !(PTR_MIN..PTR_MAX).contains(&p7) {
+        return false;
+    }
+    if !readable(p7, 8) {
+        return false;
+    }
+    let vtable = unsafe { read_usize_at(p7) };
+    if !in_game_image(vtable) {
+        return false;
+    }
+    in_game_image(unsafe { read_usize_at(vtable + 0x28) })
+}
+
+/// The value to report when [`temperature_provider_ok`] rejects `p7`: the air
+/// volume's own temperature (the leaf the provider would hand back), else the
+/// ambient base at `p1`, else the fixed fallback. `p9` is usually 0 and both
+/// pointers are game-owned, so every dereference stays guarded.
+unsafe fn temperature_fallback(p1: usize, p9: usize) -> f32 {
+    if p9 >= PTR_MIN && readable(p9 + 0x74, 4) {
+        let air = read_f32_at(p9 + 0x74);
+        if air.is_finite() {
+            return air;
+        }
+    }
+    if p1 >= PTR_MIN && readable(p1, 24) {
+        let pos = (read_f64_at(p1), read_f64_at(p1 + 8), read_f64_at(p1 + 16));
+        if pos.0.is_finite() && pos.1.is_finite() && pos.2.is_finite() {
+            return base_ambient_at(pos);
+        }
+    }
+    WORLD_FALLBACK_C
+}
+
 extern "C" fn ir_temperature_hook(
     p1: usize,
     p2: usize,
@@ -1132,100 +1281,119 @@ extern "C" fn ir_temperature_hook(
     p8: usize,
     p9: usize,
 ) -> f32 {
-    cache_variant(&[p2, p3, p4, p5, p6, p7, p8, p9]);
-    TEMP_READY.store(true, Ordering::SeqCst);
-    if !TEMP_FIRST.swap(true, Ordering::SeqCst) {
-        log_line("temperature hook first call: heat containers cached");
-    }
+    // Plugin work is wrapped: a panic in here would abort the process on the
+    // game thread, so it must never unwind through the detour.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        cache_variant(&[p2, p3, p4, p5, p6, p7, p8, p9]);
+        TEMP_READY.store(true, Ordering::SeqCst);
+        if !TEMP_FIRST.swap(true, Ordering::SeqCst) {
+            log_line("temperature hook first call: heat containers cached");
+        }
 
-    // Periodic container dump independent of ir.scan: engines and temperature
-    // sensors drive this hook even when no seeker component exists, so the
-    // diagnostics stay alive in sessions without one.
-    #[cfg(feature = "logging")]
-    unsafe {
-        use std::sync::atomic::AtomicUsize;
-        static TEMP_DUMP_COUNT: AtomicUsize = AtomicUsize::new(0);
-        let n = TEMP_DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n % 600 == 0 {
-            log_line(&format!(
-                "temperature hook dump #{n}: heat={:#x} fires={:#x} same={}",
-                p2,
-                p5,
-                p2 == p5
-            ));
-            log_heat_container(p2);
-            log_volume_heat_sources(p2);
-            log_fires_container(p5);
-            let jet_calls = JET_TICK_CALLS.swap(0, Ordering::Relaxed);
-            let rocket_calls = ROCKET_TICK_CALLS.swap(0, Ordering::Relaxed);
-            let jet_power = f64::from_bits(JET_MAX_POWER_BITS.swap(0, Ordering::Relaxed));
-            let jet_heat = f64::from_bits(JET_MAX_HEAT_BITS.swap(0, Ordering::Relaxed));
-            let rocket_power = f64::from_bits(ROCKET_MAX_POWER_BITS.swap(0, Ordering::Relaxed));
-            let engine_sources = EMITTER_PENDING
-                .lock()
-                .map(|pending| pending.len())
-                .unwrap_or(0);
-            log_line(&format!(
-                "engine state: jet_calls={jet_calls} jet_max_power={jet_power:.4} jet_max_heat={jet_heat:.4} \
-rocket_calls={rocket_calls} rocket_max_power={rocket_power:.4} ir_sources={engine_sources}"
-            ));
-            if let Ok(mut samples) = ENGINE_SAMPLES.lock() {
-                samples.sort_by(|a, b| {
-                    b.max_power
-                        .max(b.max_heat)
-                        .partial_cmp(&a.max_power.max(a.max_heat))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                log_line(&format!("engine blocks tracked: {}", samples.len()));
-                for sample in samples.iter().take(10) {
-                    log_line(&format!(
-                        "  {} {:#x} name={} size={:.2}m max_power={:.4} max_heat={:.4} burning={} \
-drain={:.5} prop={:.4} fuel={:.4} segments={:.1} pos=({:.1},{:.1},{:.1})",
-                        sample.family,
-                        sample.key,
-                        definition_name(read_usize_at(sample.key + 0x58)),
-                        sample.size_m,
-                        sample.max_power,
-                        sample.max_heat,
-                        sample.burning as u8,
-                        sample.drain,
-                        sample.propellant,
-                        read_f32_at(sample.key + 0x414),
-                        read_f32_at(sample.key + 0x1f0),
-                        sample.x,
-                        sample.y,
-                        sample.z
-                    ));
-                }
-                // Live per-component field windows, so a rocket that only
-                // shows state while burning (solid boosters) is captured too.
-                for sample in samples.iter().filter(|sample| sample.family == "rocket").take(10) {
-                    if !readable(sample.key, 0x790) {
-                        continue;
+        // Periodic container dump independent of ir.scan: engines and temperature
+        // sensors drive this hook even when no seeker component exists, so the
+        // diagnostics stay alive in sessions without one.
+        #[cfg(feature = "logging")]
+        unsafe {
+            use std::sync::atomic::AtomicUsize;
+            static TEMP_DUMP_COUNT: AtomicUsize = AtomicUsize::new(0);
+            let n = TEMP_DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n % 600 == 0 {
+                log_line(&format!(
+                    "temperature hook dump #{n}: heat={:#x} fires={:#x} same={}",
+                    p2,
+                    p5,
+                    p2 == p5
+                ));
+                log_heat_container(p2);
+                log_volume_heat_sources(p2);
+                log_fires_container(p5);
+                let jet_calls = JET_TICK_CALLS.swap(0, Ordering::Relaxed);
+                let rocket_calls = ROCKET_TICK_CALLS.swap(0, Ordering::Relaxed);
+                let jet_power = f64::from_bits(JET_MAX_POWER_BITS.swap(0, Ordering::Relaxed));
+                let jet_heat = f64::from_bits(JET_MAX_HEAT_BITS.swap(0, Ordering::Relaxed));
+                let rocket_power = f64::from_bits(ROCKET_MAX_POWER_BITS.swap(0, Ordering::Relaxed));
+                let engine_sources = EMITTER_PENDING
+                    .lock()
+                    .map(|pending| pending.len())
+                    .unwrap_or(0);
+                log_line(&format!(
+                    "engine state: jet_calls={jet_calls} jet_max_power={jet_power:.4} jet_max_heat={jet_heat:.4} \
+    rocket_calls={rocket_calls} rocket_max_power={rocket_power:.4} ir_sources={engine_sources}"
+                ));
+                if let Ok(mut samples) = ENGINE_SAMPLES.lock() {
+                    // Reads stale component/definition pointers unchecked: deep-dump only.
+                    if DEEP_DUMP_DISABLED.load(Ordering::Relaxed) {
+                        samples.clear();
                     }
-                    let definition = read_usize_at(sample.key + 0x58);
-                    log_line(&format!(
-                        "rocket fields[{:#x}] def={:#x} sub={} throttle={:.4} win1c0:{} win270:{} \
-win400:{} win760:{}",
-                        sample.key,
-                        definition,
-                        read_u32_at(definition + 0xed4),
-                        read_f32_at(sample.key + 0x268),
-                        float_window(sample.key, 0x1c0, 8),
-                        float_window(sample.key, 0x270, 12),
-                        float_window(sample.key, 0x400, 40),
-                        float_window(sample.key, 0x760, 20),
-                    ));
+                    samples.sort_by(|a, b| {
+                        b.max_power
+                            .max(b.max_heat)
+                            .partial_cmp(&a.max_power.max(a.max_heat))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    log_line(&format!("engine blocks tracked: {}", samples.len()));
+                    for sample in samples.iter().take(10) {
+                        log_line(&format!(
+                            "  {} {:#x} name={} size={:.2}m max_power={:.4} max_heat={:.4} burning={} \
+    drain={:.5} prop={:.4} fuel={:.4} segments={:.1} pos=({:.1},{:.1},{:.1})",
+                            sample.family,
+                            sample.key,
+                            definition_name(read_usize_at(sample.key + 0x58)),
+                            sample.size_m,
+                            sample.max_power,
+                            sample.max_heat,
+                            sample.burning as u8,
+                            sample.drain,
+                            sample.propellant,
+                            read_f32_at(sample.key + 0x414),
+                            read_f32_at(sample.key + 0x1f0),
+                            sample.x,
+                            sample.y,
+                            sample.z
+                        ));
+                    }
+                    // Live per-component field windows, so a rocket that only
+                    // shows state while burning (solid boosters) is captured too.
+                    for sample in samples.iter().filter(|sample| sample.family == "rocket").take(10) {
+                        if !readable(sample.key, 0x790) {
+                            continue;
+                        }
+                        let definition = read_usize_at(sample.key + 0x58);
+                        log_line(&format!(
+                            "rocket fields[{:#x}] def={:#x} sub={} throttle={:.4} win1c0:{} win270:{} \
+    win400:{} win760:{}",
+                            sample.key,
+                            definition,
+                            read_u32_at(definition + 0xed4),
+                            read_f32_at(sample.key + 0x268),
+                            float_window(sample.key, 0x1c0, 8),
+                            float_window(sample.key, 0x270, 12),
+                            float_window(sample.key, 0x400, 40),
+                            float_window(sample.key, 0x760, 20),
+                        ));
+                    }
+                    dump_class_fields(&samples, &["preset", "custom", "fluid", "steam"], "class");
+                    samples.clear();
                 }
-                dump_class_fields(&samples, &["preset", "custom", "fluid", "steam"], "class");
-                samples.clear();
             }
         }
-    }
+    }));
 
     let original = ORIG_TEMPERATURE.load(Ordering::SeqCst);
     if original == 0 {
         return 0.0;
+    }
+    // p7 is dereferenced unconditionally by the original (0x31000C), so an
+    // invalid provider must be rejected before the call, never forwarded.
+    if !temperature_provider_ok(p7) {
+        log_once(LOG_TEMPERATURE_PROVIDER, || {
+            format!(
+                "temperature hook: invalid provider p7={p7:#x}; returning the ambient fallback \
+    instead of calling the evaluator"
+            )
+        });
+        return unsafe { temperature_fallback(p1, p9) };
     }
     let f: unsafe extern "C" fn(
         usize,
@@ -1253,13 +1421,15 @@ pub(crate) extern "C" fn ir_fires_hook(
     p5: usize,
     p6: usize,
 ) {
-    if p1 >= 0x10000 {
-        FIRES_HOLDER.store(p1, Ordering::Relaxed);
-        static FIRST: AtomicBool = AtomicBool::new(false);
-        if !FIRST.swap(true, Ordering::Relaxed) {
-            log_line("fires builder hook first call: fires holder cached");
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if p1 >= 0x10000 {
+            FIRES_HOLDER.store(p1, Ordering::Relaxed);
+            static FIRST: AtomicBool = AtomicBool::new(false);
+            if !FIRST.swap(true, Ordering::Relaxed) {
+                log_line("fires builder hook first call: fires holder cached");
+            }
         }
-    }
+    }));
     let original = ORIG_FIRES_BUILD.load(Ordering::SeqCst);
     if original == 0 {
         return;
@@ -1285,36 +1455,38 @@ pub(crate) extern "C" fn ir_sun_update_hook(p1: usize, f0: f32, f1: f32, p3: u32
             unsafe { std::mem::transmute(original) };
         unsafe { f(p1, f0, f1, p3, p4) };
     }
-    if p4 >= 0x10000 {
-        let x = unsafe { read_f64_at(p4 + 0x198) };
-        let y = unsafe { read_f64_at(p4 + 0x1a0) };
-        let z = unsafe { read_f64_at(p4 + 0x1a8) };
-        let n = (x * x + y * y + z * z).sqrt();
-        if n > 100.0 && n < 1.0e9 {
-            if let Ok(mut g) = SUN_DIR.lock() {
-                g[0] = x;
-                g[1] = y;
-                g[2] = z;
-            }
-            let pct_f = if (0.0..=1.0).contains(&f1) {
-                f1
-            } else if (0.0..=1.0).contains(&f0) {
-                f0
-            } else {
-                0.0
-            };
-            SUN_PCT.store(
-                (pct_f as f64 * 1000.0).clamp(0.0, 1_000_000.0) as usize,
-                Ordering::Relaxed,
-            );
-            if !SUN_DIR_VALID.swap(true, Ordering::Relaxed) {
-                log_line(&format!(
-                    "sun update hook first call: sprite=({:.0},{:.0},{:.0}) f0={:.4} f1={:.4}",
-                    x, y, z, f0, f1
-                ));
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if p4 >= 0x10000 {
+            let x = unsafe { read_f64_at(p4 + 0x198) };
+            let y = unsafe { read_f64_at(p4 + 0x1a0) };
+            let z = unsafe { read_f64_at(p4 + 0x1a8) };
+            let n = (x * x + y * y + z * z).sqrt();
+            if n > 100.0 && n < 1.0e9 {
+                if let Ok(mut g) = SUN_DIR.lock() {
+                    g[0] = x;
+                    g[1] = y;
+                    g[2] = z;
+                }
+                let pct_f = if (0.0..=1.0).contains(&f1) {
+                    f1
+                } else if (0.0..=1.0).contains(&f0) {
+                    f0
+                } else {
+                    0.0
+                };
+                SUN_PCT.store(
+                    (pct_f as f64 * 1000.0).clamp(0.0, 1_000_000.0) as usize,
+                    Ordering::Relaxed,
+                );
+                if !SUN_DIR_VALID.swap(true, Ordering::Relaxed) {
+                    log_line(&format!(
+                        "sun update hook first call: sprite=({:.0},{:.0},{:.0}) f0={:.4} f1={:.4}",
+                        x, y, z, f0, f1
+                    ));
+                }
             }
         }
-    }
+    }));
 }
 
 /// Hook on the per-frame render uniform fill FUN_1406bb400.  It runs on the
@@ -1343,6 +1515,17 @@ pub(crate) extern "C" fn ir_frame_uniforms_hook(
     p14: u8,
     p15: usize,
 ) {
+    // FLIR: this is the scene submit, so the per-view IR state must be ready
+    // BEFORE the pass draws anything. The mesh -> body map is NOT built here:
+    // this runs on the render thread and the game rebuilds the vehicle/body
+    // containers on its own thread, so the walk lives in the scene tick and
+    // only the published map is read here.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !p11.is_null() && (p11 as usize) >= 0x10000 {
+            crate::flir::on_scene_submit(p2, p11 as usize, p12);
+        }
+    }));
+
     let original = ORIG_FRAME_UNIFORMS.load(Ordering::SeqCst);
     if original != 0 {
         let f: unsafe extern "C" fn(
@@ -1364,54 +1547,85 @@ pub(crate) extern "C" fn ir_frame_uniforms_hook(
         ) = unsafe { std::mem::transmute(original) };
         unsafe { f(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15) };
     }
-    if p2 >= 0x10000 {
-        let prev = SCENE.swap(p2, Ordering::Relaxed);
-        if prev != p2 {
-            static ONCE: AtomicBool = AtomicBool::new(false);
-            if !ONCE.swap(true, Ordering::Relaxed) {
-                let clock = unsafe { read_u32_at(p2 + 0xbaec0) };
-                log_line(&format!(
-                    "scene cached from render uniforms: scene={:#x} clock={}",
-                    p2, clock
-                ));
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if p2 >= 0x10000 {
+            let prev = SCENE.swap(p2, Ordering::Relaxed);
+            if prev != p2 {
+                static ONCE: AtomicBool = AtomicBool::new(false);
+                if !ONCE.swap(true, Ordering::Relaxed) {
+                    let clock = unsafe { read_u32_at(p2 + 0xbaec0) };
+                    log_line(&format!(
+                        "scene cached from render uniforms: scene={:#x} clock={}",
+                        p2, clock
+                    ));
+                }
             }
         }
-    }
-    if !p11.is_null() && (p11 as usize) >= 0x10000 {
-        let base = p11 as usize + 0x8f0; // +0x11e doubles
-        let x = unsafe { read_f64_at(base) };
-        let y = unsafe { read_f64_at(base + 8) };
-        let z = unsafe { read_f64_at(base + 16) };
-        let n = (x * x + y * y + z * z).sqrt();
-        if n > 1.0e-6 && n < 1.0e9 {
-            if let Ok(mut g) = LIGHT_DIR.lock() {
-                g[0] = x;
-                g[1] = y;
-                g[2] = z;
+        if !p11.is_null() && (p11 as usize) >= 0x10000 {
+            let base = p11 as usize + 0x8f0; // +0x11e doubles
+            let x = unsafe { read_f64_at(base) };
+            let y = unsafe { read_f64_at(base + 8) };
+            let z = unsafe { read_f64_at(base + 16) };
+            let n = (x * x + y * y + z * z).sqrt();
+            if n > 1.0e-6 && n < 1.0e9 {
+                if let Ok(mut g) = LIGHT_DIR.lock() {
+                    g[0] = x;
+                    g[1] = y;
+                    g[2] = z;
+                }
+                LIGHT_DIR_VALID.store(true, Ordering::Relaxed);
             }
-            LIGHT_DIR_VALID.store(true, Ordering::Relaxed);
         }
-    }
+    }));
 }
 
 /// Cache the scene object from the scene tick (its arg 1 IS the scene): the
 /// day-cycle clock (+0xbaec0, copied from the authoritative +0xbbaac each
 /// tick) and the sky state all live on it. Runs every game tick.
-pub(crate) extern "C" fn ir_scene_tick_hook(p1: usize, p2: usize, p3: usize) {
-    if p1 >= 0x10000 {
-        SCENE.store(p1, Ordering::Relaxed);
-        static FIRST: AtomicBool = AtomicBool::new(false);
-        if !FIRST.swap(true, Ordering::Relaxed) {
-            log_line("scene tick hook first call: scene object cached (sun live)");
+#[allow(clippy::too_many_arguments)]
+pub(crate) extern "C" fn ir_scene_tick_hook(
+    p1: usize, p2: usize, p3: usize, p4: usize, p5: usize,
+    p6: usize, p7: usize, p8: usize, p9: usize, p10: usize,
+) -> usize {
+    // One synchronous pass on the game thread (our sim plus the game's vehicle
+    // update with its per-component tick hooks): readable() results are reused
+    // within it instead of one VirtualQuery per component per hook call.
+    let _regions = crate::memory::RegionCacheScope::new();
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if p1 >= 0x10000 {
+            let previous = SCENE.swap(p1, Ordering::Relaxed);
+            if previous != 0 && previous != p1 {
+                // New world (load / host / rejoin): pointers cached from the old
+                // scene are freed memory that may still read as valid.
+                crate::heat::forget_world();
+                FIRES_HOLDER.store(0, Ordering::Relaxed);
+                crate::flir::RENDER_TARGETS_STALE.store(true, Ordering::Relaxed);
+                log_line(&format!("scene changed {previous:#x} -> {p1:#x}: world caches dropped"));
+            }
+            static FIRST: AtomicBool = AtomicBool::new(false);
+            if !FIRST.swap(true, Ordering::Relaxed) {
+                log_line("scene tick hook first call: scene object cached (sun live)");
+            }
         }
-    }
+        // scene tick: drive the FLIR block temperature simulation and cache the
+        // ambient temperature at the IR camera (game thread, so the heat model is
+        // only ever evaluated from here). The sim has its own kill switch: it is
+        // the phase most likely to touch a freshly spawned vehicle's containers.
+        if p1 >= 0x10000 {
+            if !SIM_DISABLED.load(Ordering::Relaxed) {
+                crate::blocktemp::tick(p1);
+            }
+            crate::flir::scene_tick(p1);
+        }
+    }));
     let original = ORIG_SCENE_TICK.load(Ordering::SeqCst);
     if original == 0 {
-        return;
+        return 0;
     }
-    let f: unsafe extern "C" fn(usize, usize, usize) =
+    // 10 args (a7 is a float in its stack slot, forwarded bit-exact); returns __int64.
+    let f: unsafe extern "C" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize =
         unsafe { std::mem::transmute(original) };
-    unsafe { f(p1, p2, p3) }
+    unsafe { f(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10) }
 }
 
 pub(crate) unsafe fn install_hooks() -> Result<(), String> {
@@ -1534,7 +1748,7 @@ pub(crate) unsafe fn install_hooks() -> Result<(), String> {
 
     let original_frame_uniforms = MinHook::create_hook(
         frame_uniforms as *mut c_void,
-        ir_frame_uniforms_hook as *const c_void as *mut c_void,
+        crate::flir::scene_submit_entry() as *mut c_void,
     )
     .map_err(|status| format!("MinHook create_hook(frame uniforms) failed: {status}"))?;
     ORIG_FRAME_UNIFORMS.store(original_frame_uniforms as usize, Ordering::SeqCst);
@@ -1657,6 +1871,11 @@ pub(crate) unsafe fn install_hooks() -> Result<(), String> {
         MinHook::enable_hook(exhaust_update as *mut c_void)
             .map_err(|status| format!("MinHook enable_hook(exhaust update) failed: {status}"))?;
     }
+
+    // FLIR render side: tonemap replacement, block pass and camera IR latch.
+    // Every piece is independent and fail-closed; only this feature is lost on
+    // a mismatch.
+    unsafe { crate::flir::install(base) };
 
     HOOKS_INSTALLED.store(true, Ordering::SeqCst);
     Ok(())

@@ -40,10 +40,14 @@ pub(crate) fn exhaust_index_temperature(index: u32) -> Option<f64> {
 /// Walk a heat container and emit every record as an IrSource, applying the
 /// radiometric falloff. Records are evaluated regardless of their owner (the
 /// game's own evaluation filters by owner, which would hide other vehicles).
+/// The game (temperature_eval_at_pos 0x14030FD60 via 0x14030BD10) reads a
+/// record as ambient + factor(+0x114) * temp(+0x118), so +0x118 is an excess
+/// over the air, not an absolute temperature.
 pub(crate) unsafe fn collect_ir_sources(
     c: usize,
     origin: &Vec3,
     range: f64,
+    ambient_c: f64,
     out: &mut Vec<IrSource>,
 ) {
     if c < 0x10000 {
@@ -104,9 +108,10 @@ pub(crate) unsafe fn collect_ir_sources(
         if surface > range {
             continue;
         }
+        let temp = ambient_c + factor.min(1.0) * temp;
         let t_k = temp + 273.15;
         let ref_const = mwir_ref();
-        let flux = factor * band_radiance(t_k) * (r_eff * r_eff)
+        let flux = band_radiance(t_k) * (r_eff * r_eff)
             / (surface * surface)
             / ref_const
             * weather_transmittance(wx_fog, wx_rain, surface, false);
@@ -128,7 +133,7 @@ pub(crate) unsafe fn collect_ir_sources(
 /// Fires (burning objects) as IR emitters. Container layout is what
 /// FUN_14030fd60 reads as param_5: ring slots +0x11d8, cap +0x11e0, start
 /// +0x11e4, count +0x11e8; each group holds a world position at +0x38..+0x48
-/// an intensity float at +0x94 and a fire/smoke flag at +0x91. The group is
+/// an intensity float at +0x94, an emitting flag at +0x90 and a smoke flag at +0x91. The group is
 /// allocated as exactly 0x98 bytes (FUN_1403025e0), so +0x94 is its last
 /// field, and FUN_140300110 clamps that intensity to 0..1 - it is a normalised
 /// fire strength, not a radiance. Treated here as a FIRE_T_K emitter whose
@@ -166,14 +171,21 @@ pub(crate) unsafe fn collect_fire_sources(
             continue;
         }
         // Positive floats compare consistently as raw bits, so fetch_max on
-        // the bit pattern tracks the largest intensity. +0x91 == 0 is a fire;
-        // anything else is smoke, which this model treats as a fire.
+        // the bit pattern tracks the largest intensity. +0x91 != 0 is smoke
+        // (fire_entry_set_pos_and_intensity 0x140300110 tints it 50 instead of
+        // 400); +0x90 is "still emitting", cleared by fire_object_state_tick
+        // 0x14030AE70 when the fire burns out and only its particles linger.
+        // Smoke and lingering particles are cool.
         let bits = (intensity as f32).to_bits();
         FIRE_INTENSITY_MAX_BITS.fetch_max(bits, Ordering::Relaxed);
-        if read_u32_at(group + 0x91) & 0xff == 0 {
-            FIRE_ONLY_MAX_BITS.fetch_max(bits, Ordering::Relaxed);
-        } else {
+        let smoke = read_u32_at(group + 0x91) & 0xff != 0;
+        if smoke {
             SMOKE_ONLY_MAX_BITS.fetch_max(bits, Ordering::Relaxed);
+        } else {
+            FIRE_ONLY_MAX_BITS.fetch_max(bits, Ordering::Relaxed);
+        }
+        if smoke || read_u32_at(group + 0x90) & 0xff == 0 {
+            continue;
         }
         let dx = x - origin.0;
         let dy = y - origin.1;
@@ -205,13 +217,16 @@ pub(crate) unsafe fn collect_fire_sources(
 /// Spherical heat emitters on the heat container's *second* ring.
 /// FUN_14030fd60 reads this ring (header +0x08 slots, +0x10 cap, +0x14 start, +0x18 count;
 /// slot -> holder -> record) with a (dist - radius)/5 falloff per record:
-/// heat float at +0x00 (degrees C, added to ambient), radius at +0x04 and world
-/// position doubles at +0x40/+0x48/+0x50. Burning vehicle components and body
-/// fires land here rather than in the world fire-group ring.
+/// heat fraction at +0x00, radius at +0x04 and world position doubles at
+/// +0x40/+0x48/+0x50. The game lerps ambient toward 400 C by that fraction
+/// (`base + (min(400, base + 400) - base) * heat`), so a fully burning
+/// component reads 400 C. Burning vehicle components and body fires land here
+/// rather than in the world fire-group ring.
 pub(crate) unsafe fn collect_volume_heat_sources(
     c: usize,
     origin: &Vec3,
     range: f64,
+    ambient_c: f64,
     out: &mut Vec<IrSource>,
 ) {
     if c < 0x10000 {
@@ -260,6 +275,7 @@ pub(crate) unsafe fn collect_volume_heat_sources(
         if surface > range {
             continue;
         }
+        let heat = ambient_c + ((ambient_c + 400.0).min(400.0) - ambient_c) * heat.min(1.0);
         let t_k = heat + 273.15;
         let flux = band_radiance(t_k) * (r_eff * r_eff)
             / (surface * surface)
@@ -285,15 +301,17 @@ pub(crate) unsafe fn collect_volume_heat_sources(
 /// position and a throttle-scaled emission rate each tick, so the spectrum
 /// follows throttle without touching game state.
 pub(crate) unsafe fn collect_emitter_sources(origin: &Vec3, range: f64, out: &mut Vec<IrSource>) {
-    let mut pending = match EMITTER_PENDING.lock() {
-        Ok(mut p) => std::mem::take(&mut *p),
+    // Copy, never drain: blocktemp reads the same entries every scene tick, and a
+    // seeker scan that emptied the list starved it (jets with IR seekers never heated).
+    // A despawned component never ticks again, so stale entries are aged out here.
+    let now = now_ms();
+    let pending = match EMITTER_PENDING.lock() {
+        Ok(mut p) => {
+            p.retain(|entry| now.saturating_sub(entry.1) < EMITTER_STALE_MS);
+            p.clone()
+        }
         Err(_) => return,
     };
-    // A despawned component never ticks again, so its entry would radiate
-    // forever from the last position it reported. Age entries out here - this
-    // is the only reader that runs even when every hooked component is gone.
-    let now = now_ms();
-    pending.retain(|entry| now.saturating_sub(entry.1) < EMITTER_STALE_MS);
     if pending.is_empty() {
         return;
     }

@@ -28,10 +28,11 @@ pub(crate) const RVA_RAWSETI: usize = 0x0009_8570; // FUN_140098570
 pub(crate) const RVA_REGISTER_TABLE: usize = 0x001e_22d0; // FUN_1401e22d0
 pub(crate) const RVA_STRING_ALLOC: usize = 0x0017_cbb0; // FUN_14017cbb0
 pub(crate) const RVA_STRING_FILL: usize = 0x0099_d3b0; // FUN_14099d3b0
-pub(crate) const RVA_BASE_TEMP: usize = 0x0031_00a0; // FUN_1403100a0(point,..,daybyte)->ambient
+pub(crate) const RVA_BASE_TEMP: usize = 0x0031_00a0; // FUN_1403100a0(pos, windField, weatherGrid, ignored, waterFlag) -> ambient
 pub(crate) const RVA_RAYCAST: usize = 0x001a_4160; // FUN_1401a4160(ctx,seg6d,out_hit,out_obj,grp,mask)->bool
 pub(crate) const RVA_FIRES_BUILD: usize = 0x0030_a2f0; // FUN_14030a2f0 fire vertex builder (holder owns the fires ring)
-pub(crate) const RVA_SCENE_TICK: usize = 0x005e_85e0; // FUN_1405e85e0 scene tick (arg1 = scene object; refreshes the day clock)
+// scene_vehicle_update: once per sim tick on the update thread, rcx = c_scene (0x5E85E0 was load-only).
+pub(crate) const RVA_SCENE_TICK: usize = 0x005e_8fb0;
 pub(crate) const RVA_SETTINGS: usize = 0x0029_4520; // FUN_140294520() -> settings singleton ([0] = day length, minutes)
 pub(crate) const RVA_FRAME_UNIFORMS: usize = 0x006b_b400; // FUN_1406bb400 render-thread uniform fill; arg2 = the scene object
 pub(crate) const FRAME_UNIFORMS_PROLOGUE: [u8; 32] = [
@@ -254,9 +255,98 @@ pub(crate) const SETTINGS_PROLOGUE: [u8; 32] = [
     0x00, 0x00, 0x48, 0x8b, 0x08, 0x8b, 0x04, 0x0a, 0x39, 0x05, 0xa6, 0x8c, 0xa6, 0x00, 0x7e, 0x33,
 ];
 pub(crate) const SCENE_TICK_PROLOGUE: [u8; 32] = [
-    0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
-    0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x20, 0x80, 0x3d, 0x51, 0x1e,
+    0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48,
+    0x8d, 0xa8, 0x48, 0xfd, 0xff, 0xff, 0x48, 0x81, 0xec, 0xa8, 0x03, 0x00, 0x00, 0x0f, 0x29, 0x70,
 ];
+
+// ---------------------------------------------------------------------------
+// FLIR render side (docs/FLIR_DESIGN.md "Render pipeline")
+// ---------------------------------------------------------------------------
+
+/// Tonemap pass: `fastcall(mat_set, view, params* a3)` — 3 integer-class
+/// arguments, void return (verified by disassembly). `a3+0x00` is `color_mode`,
+/// non-zero for a view that has IR enabled.
+pub(crate) const RVA_TONEMAP: usize = 0x0068_b8c0; // FUN_14068b8c0
+pub(crate) const TONEMAP_PROLOGUE: [u8; 24] = [
+    0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+    0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x50,
+];
+/// Tonemap uniforms `0x68B8C0` `r8` = `view_state + TONEMAP_PARAMS_OFF`.
+pub(crate) const VIEW_STATE_TONEMAP_PARAMS: usize = 0x870;
+/// View state field holding the per-monitor render-target holder W (the ring
+/// entry `+0x148` value; null for the main view). Persistent, unlike the feed
+/// view state which is freed every frame.
+pub(crate) const VIEW_STATE_RT_HOLDER: usize = 0x828;
+/// `c_scene_vehicle_component_camera` vtable (RVA); validates a camera pointer.
+pub(crate) const RVA_CAMERA_VTABLE: usize = 0x00b5_3420;
+/// `0x68BB00 draw_fullscreen_quad_tex5`: its single `glDrawElements` (at
+/// `0x68BC6A`, through the IAT slot `0x140A935F8`) returns into
+/// `[0x68BB00, 0x68BCA0)`; the next function starts at `0x68BCA0`. That draw
+/// is the tonemap quad, i.e. where the IR composite replaces the graded image.
+pub(crate) const RVA_TONEMAP_QUAD: usize = 0x0068_bb00;
+pub(crate) const RVA_TONEMAP_QUAD_END: usize = 0x0068_bca0;
+/// Mesh object: `+0x60` VBO, `+0x64` GL IBO id (u32). Chunk meshes are looked
+/// up by their index buffer in the draw thunk (mesh = `*(*(element))+8`).
+pub(crate) const MESH_IBO: usize = 0x64;
+// GL dispatch slots the game calls through (GLEW pointer globals / import
+// table entries). Re-pointing them lets the FLIR passes draw through their own
+// programs: the draw thunk sees every submitted draw, the matrix upload thunk
+// captures `mat_view_proj`/`mat_world`, and the framebuffer bind thunk finds
+// the G-buffer.
+pub(crate) const RVA_GL_DRAW_ELEMENTS: usize = 0x00a9_35f8;
+pub(crate) const RVA_GL_UNIFORM_MATRIX4FV: usize = 0x00ce_3268;
+pub(crate) const RVA_GL_BIND_FRAMEBUFFER: usize = 0x00ce_5688;
+// GLEW dispatch slots used only to TRACK GL state (no driver query in the draw
+// hot path). Found from glewInit's `lea rcx,"glXxx"; call wglGetProcAddress;
+// mov [slot],rax` sequences (0x140995EFB, 0x140995623, 0x140994AA6, 0x140987156).
+pub(crate) const RVA_GL_USE_PROGRAM: usize = 0x00ce_3280;
+/// GLEW slot of `glUniform1f` (string xref, see RE notes).
+pub(crate) const RVA_GL_UNIFORM1F: usize = 0x00ce_30a8;
+/// GLEW slot of `glUniform3f` (light_pass_uniforms 0x1406842B0).
+pub(crate) const RVA_GL_UNIFORM3F: usize = 0x00ce_3168;
+pub(crate) const RVA_GL_BIND_BUFFER: usize = 0x00ce_83e8;
+pub(crate) const RVA_GL_ACTIVE_TEXTURE: usize = 0x00ce_7850;
+pub(crate) const RVA_GL_BIND_VERTEX_ARRAY: usize = 0x00ce_7270;
+/// IAT slot of `glViewport` (OPENGL32 import; `objdump -p` import table).
+pub(crate) const RVA_GL_VIEWPORT: usize = 0x00a9_3650;
+/// OPENGL32 IAT glBindTexture (objdump -p).
+pub(crate) const RVA_GL_BIND_TEXTURE: usize = 0x00a9_3678;
+// Camera component fields (from the camera serializer).
+pub(crate) const CAMERA_PIVOT: usize = 0x680;
+// Scene / body containers for the per-frame mesh -> body map.
+pub(crate) const SCENE_VEHICLE_CONTAINER: usize = 0x4988;
+pub(crate) const SCENE_VEHICLE_SET: usize = 0x320;
+pub(crate) const BODY_CHUNK_ITEMS: usize = 0x540;
+/// Second (pass-B) chunk table, same layout as `BODY_CHUNK_ITEMS` (re_chunks).
+pub(crate) const BODY_CHUNK_ITEMS_B: usize = 0x588;
+
+/// Encoded temperature range carried through the colour G-buffer. Wide enough
+/// that an engine block and a rocket plume keep usable resolution at 8 bits.
+pub(crate) const FLIR_ENC_MIN_C: f32 = -50.0;
+pub(crate) const FLIR_ENC_MAX_C: f32 = 2000.0;
+/// Cold sky temperature for FLIR (clear zenith is far below ambient).
+pub(crate) const FLIR_SKY_C: f32 = -60.0;
+/// Maximum solar soak added to a surface facing the sun, degrees C.
+pub(crate) const FLIR_SUN_SOAK_C: f32 = 25.0;
+/// Depth beyond which a fragment is treated as sky rather than terrain/water.
+// Just inside the depth far plane (20100 m): only cleared depth is sky. The
+// moon/sun sprites (~18 km) are caught by the composite's height test.
+pub(crate) const FLIR_SKY_DEPTH_M: f32 = 19_500.0;
+/// Ambient used when the game's heat model is not reachable yet.
+pub(crate) const FLIR_AMBIENT_FALLBACK_C: f32 = 20.0;
+/// GL texture unit the block pass binds the body temperature volume to.
+pub(crate) const FLIR_TEXTURE_UNIT: u32 = 7;
+/// A body volume is re-uploaded at most once per this many scene submits, so a
+/// block that warms continuously cannot re-upload every frame.
+pub(crate) const FLIR_UPLOAD_INTERVAL_FRAMES: u64 = 2;
+/// Upper bound on cached body volumes before unused ones are evicted.
+pub(crate) const FLIR_GRID_TEXTURE_MAX: usize = 128;
+/// A registered FLIR camera not refreshed for this long is no longer sampled for ambient.
+pub(crate) const FLIR_IR_CAMERA_STALE_MS: u64 = 2000;
+/// A tonemap output target that no scene submit refreshed for this long is
+/// dropped (with its G-buffer pairing): at one frame per view it only outlives a
+/// view that stopped rendering, and a recycled framebuffer id is never trusted.
+pub(crate) const FLIR_TARGET_STALE_MS: u64 = 1000;
 
 pub(crate) const TAU: f64 = std::f64::consts::TAU;
 

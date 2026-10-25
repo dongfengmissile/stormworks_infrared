@@ -2,7 +2,7 @@
 //! the Lua API. Kept separate from `offsets` so the layout of the game is
 //! never mixed with our own runtime bookkeeping.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::Mutex;
@@ -52,6 +52,17 @@ pub(crate) static PRESET_HOOKS_DISABLED: AtomicBool = AtomicBool::new(false);
 pub(crate) static MODULAR_HOOKS_DISABLED: AtomicBool = AtomicBool::new(false);
 pub(crate) static FLUID_HOOKS_DISABLED: AtomicBool = AtomicBool::new(false);
 pub(crate) static SCREEN_HOOKS_DISABLED: AtomicBool = AtomicBool::new(false);
+/// Kill switch for the FLIR render side (new GL-level hooks): a prologue or
+/// runtime mismatch already disables it, this lets a user do so up front.
+pub(crate) static FLIR_DISABLED: AtomicBool = AtomicBool::new(false);
+/// FLIR block substitution off, composite still on (`infrared_disable_blockpass`).
+pub(crate) static BLOCKPASS_DISABLED: AtomicBool = AtomicBool::new(false);
+/// Block thermal simulation off: `blocktemp::tick` is never called
+/// (`infrared_disable_sim`).
+pub(crate) static SIM_DISABLED: AtomicBool = AtomicBool::new(false);
+/// FLIR composite off, block substitution still on
+/// (`infrared_disable_composite`).
+pub(crate) static COMPOSITE_DISABLED: AtomicBool = AtomicBool::new(false);
 pub(crate) static ORIG_EXHAUST_UPDATE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static ORIG_ROCKET_TICK: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static ORIG_JET_TICK: AtomicUsize = AtomicUsize::new(0);
@@ -110,6 +121,11 @@ pub(crate) static ROCKET_MAX_POWER_BITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EMITTER_PENDING: Mutex<Vec<(usize, u64, f64, f64, f64, f64, f64, f64)>> =
     Mutex::new(Vec::new());
 
+/// Keys in EMITTER_PENDING that are exhaust plume emitters (not components):
+/// blocktemp heats the blocks around these as heat points instead of binding
+/// them to a component's cells.
+pub(crate) static EXHAUST_EMITTERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
 /// Entries older than this are dropped as phantoms of despawned components.
 /// Anything alive refreshes its entry every tick, so 2 s is generous.
 pub(crate) const EMITTER_STALE_MS: u64 = 2000;
@@ -120,7 +136,7 @@ pub(crate) const EMITTER_STALE_MS: u64 = 2000;
 /// rebuild: INFRARED_NO_DEEPDUMP=1 or an `infrared_disable_deepdump` marker
 /// file next to the log.
 pub(crate) static DEEP_DUMP_DISABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
@@ -131,6 +147,14 @@ pub(crate) fn now_ms() -> u64 {
         .get_or_init(std::time::Instant::now)
         .elapsed()
         .as_millis() as u64
+}
+
+/// Microseconds since the plugin loaded (short-interval polling thresholds).
+pub(crate) fn now_us() -> u64 {
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
 }
 
 /// In-cone sources from the most recent scan as (distance m, effective radius
@@ -164,6 +188,61 @@ pub(crate) static VARIANT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) static TEMP_FIRST: AtomicBool = AtomicBool::new(false);
 pub(crate) static SCAN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// ---------------------------------------------------------------------------
+// FLIR camera view (docs/FLIR_DESIGN.md)
+// ---------------------------------------------------------------------------
+
+/// Per-camera FLIR presentation. Missing entry = defaults (white hot, RGB 1,1,1,
+/// window [-5, 60] C). Keyed by the camera component pointer.
+#[derive(Clone, Copy)]
+pub(crate) struct FlirCfg {
+    pub rgb: [f32; 3],
+    pub black_hot: bool,
+    pub tmin: f32,
+    pub tmax: f32,
+    /// Set by `ir.flir`; only honoured while fresh (see `flir_enabled_cfg`).
+    pub enabled: bool,
+    pub enabled_ms: u64,
+}
+
+impl Default for FlirCfg {
+    fn default() -> Self {
+        FlirCfg {
+            rgb: [1.0, 1.0, 1.0],
+            black_hot: false,
+            tmin: -5.0,
+            tmax: 60.0,
+            enabled: false,
+            enabled_ms: 0,
+        }
+    }
+}
+
+/// `ir.flir` must be re-called within this window or FLIR switches off.
+pub(crate) const FLIR_ENABLE_TTL_MS: u64 = 1000;
+
+/// The camera's FLIR config, only if `ir.flir(true)` was called within 1 s.
+pub(crate) fn flir_enabled_cfg(camera: usize) -> Option<FlirCfg> {
+    let map = FLIR_CONFIG.lock().unwrap_or_else(|p| p.into_inner());
+    let cfg = *map.get(&camera)?;
+    (cfg.enabled && now_ms().saturating_sub(cfg.enabled_ms) <= FLIR_ENABLE_TTL_MS).then_some(cfg)
+}
+
+pub(crate) static FLIR_CONFIG: std::sync::LazyLock<Mutex<HashMap<usize, FlirCfg>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Ambient air temperature (°C) at the scene, as f32 bits, refreshed on the game
+/// thread by `flir::scene_tick` (median of the thermal sim's body samples). NaN
+/// bits mean "not sampled yet": the composite then uses its fixed fallback. It
+/// is never computed from the render thread (the heat evaluator is game-thread
+/// only).
+pub(crate) static FLIR_SCENE_AMBIENT_BITS: AtomicU32 = AtomicU32::new(0x7fc0_0000);
+
+// FLIR hook trampolines (installed by src/flir.rs).
+pub(crate) static ORIG_TONEMAP: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static ORIG_GL_DRAW_ELEMENTS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static ORIG_GL_UNIFORM_MATRIX4FV: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static ORIG_GL_BIND_FRAMEBUFFER: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
 // logging
