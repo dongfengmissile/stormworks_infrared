@@ -1,6 +1,6 @@
 # stormworks-infrared
 
-A plugin for [Stormworks: Build and Rescue](https://store.steampowered.com/app/573090/Stormworks_Build_and_Rescue/) that exposes the game's own heat system to component-mod Lua scripts and adds a FLIR mode to cameras that the game was lacking.
+A plugin for [Stormworks: Build and Rescue](https://store.steampowered.com/app/573090/Stormworks_Build_and_Rescue/) that exposes the game's own heat system (and simulates it where the game lacks) to component-mod Lua scripts and adds a FLIR mode to cameras that the game was lacking.
 
 ## READ THIS FIRST
 
