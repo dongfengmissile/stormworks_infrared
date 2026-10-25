@@ -103,16 +103,12 @@ local cells, az_err, el_err, strength, flux, ambient, n_sources, id = ir.scan(
 
 ## FLIR camera view
 
-A microcontroller whose **video input** is wired to a camera can turn FLIR on for that camera. The camera's own **Infrared Mode** is left alone and keeps working as the game renders it. Every vehicle block carries a simulated temperature (mass-weighted heat capacity, conduction between neighbouring blocks, the game's own engine/fire/fluid heat as a source, sun and air), so a worn engine shows hot while a cold hull stays near ambient. Terrain and water sit at ambient plus sun soak; sky is cold.
+A microcontroller LUA node whose **video input** is wired to a camera can turn FLIR on for that camera. The camera's own **Infrared Mode** is left alone and keeps working as the game renders it. Every vehicle block carries a simulated temperature, so a worn engine shows hot while a cold hull stays near ambient. Terrain and water sit at ambient plus sun soak; sky is cold.
 
 ```lua
-ir.flir(on)                                      -- bool (or number, nonzero = on)
+ir.flir(on)                                      -- bool
 ir.flir_config(r, g, b, black_hot, tmin, tmax)   -- presentation only
 ```
-
-`ir.flir(on)` enables or disables FLIR for the camera feeding this microcontroller. **Call it every tick:** the enable expires 1 s after the last call, so FLIR switches itself off if the script stops or the vehicle is removed. `ir.flir(false)` disables immediately. Returns `true` if a camera was resolved from the video link, `false` otherwise (use it to show "no camera").
-
-`ir.flir_config` sets the presentation and does not enable FLIR:
 
 | argument | meaning |
 |---|---|
@@ -120,28 +116,7 @@ ir.flir_config(r, g, b, black_hot, tmin, tmax)   -- presentation only
 | `black_hot` | `true` = black hot (the tinted white-hot picture with its colours inverted, like an image editor's invert), `false` = white hot (default white hot) |
 | `tmin`, `tmax` | display window in °C, `tmin < tmax` (default `-5`, `60`) |
 
-It returns `true` when stored, `false` when arguments are invalid or the video input is not fed by a camera. Without a config call, defaults are used.
-
-Wiring:
-
-1. Put a camera and a microcontroller on the vehicle.
-2. Wire the camera's **video output** to the microcontroller's **video input**.
-3. Wire the microcontroller's **video output** to the monitor; the FLIR image is shown there with the script's `onDraw` overlay on top.
-4. Call `ir.flir` (and optionally `ir.flir_config`) from `onTick`. The link is resolved per call; state is keyed by the camera, so two cameras need two microcontrollers.
-
-See `examples/ir_flir.lua`. In a development (debug) build, **F10** toggles FLIR on the main player view as well, for tuning without a camera.
-
-## What the seeker sees
-
-- **Heat sources** — every engine type, fluid pipes, anything the game tracks heat for.
-- **Fires and flares** — a lit flare registers as a fire, so it works as an IR countermeasure once it is inside the acquisition cone and outshines the target
-- **The sun** — blocked by terrain; inside the acquisition cone it outshines any target and steals the lock
-- **Smoke** — cool: only burning fires (and flares) are hot, not smoke or a burnt-out fire's lingering particles
-- **Weather** — fog and rain attenuate every emitter, fog far more than rain
-- **Contrast** — a seeker sees radiance above the background (the air at the seeker), so anything at or below air temperature is invisible
-- **Water** — opaque to IR: nothing underwater is seen, and a seeker underwater sees nothing
-- **Its own vehicle** — every heat source on the seeker's own vehicle is ignored
-- **Occlusion** — players, terrain, buildings and vehicle hulls block sources via the game's raycast
+See `examples/ir_flir.lua` for an example script. The camera video output needs to be connected to the LUA microcontroller block.
 
 ## Game updates
 
