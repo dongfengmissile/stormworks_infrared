@@ -4,8 +4,8 @@
 
 /// Build this DLL was relocated against.
 /// stormworks64.exe sha256:
-/// f9206d85c82f4d02fd0ac391781d19c5c68394a9ffc48accca0e1f5966db8699
-pub(crate) const GAME_BUILD_LABEL: &str = "f9206d85c82f";
+/// f7d605e34fe3b8ebde3adbc8e2e90fe28821c6cb3ef67be79abe58ce652968a0 (v1.15.25; offsets mapped from f9206d85c82f, see stormworks_idapro/new/UPDATE_MAP.md)
+pub(crate) const GAME_BUILD_LABEL: &str = "f7d605e34fe3";
 
 /// Unique stamp of THIS plugin binary (unix seconds at compile time), logged
 /// at bootstrap. On-disk checksums cannot tell you what a running game has
@@ -14,30 +14,30 @@ pub(crate) const GAME_BUILD_LABEL: &str = "f9206d85c82f";
 pub(crate) const PLUGIN_BUILD_LABEL: &str = env!("INFRARED_BUILD_STAMP");
 
 // RVAs (image base 0x140000000).
-pub(crate) const RVA_COMPONENT_LUA_REGISTRAR: usize = 0x0032_be50; // FUN_14032be50
+pub(crate) const RVA_COMPONENT_LUA_REGISTRAR: usize = 0x0032_e3d0; // FUN_14032be50
 // The screen/microcontroller Lua initializer: it builds the `debug`, `async` and
 // `screen` tables, so it is the state an on-screen image has to be drawn from.
 // The component-mod registrar above only reaches component scripts, which cannot
 // draw, and its state has no screen API.
-pub(crate) const RVA_LUA_SCREEN_INIT: usize = 0x002e_5230; // FUN_1402e5230
-pub(crate) const RVA_TEMPERATURE: usize = 0x0030_fd60; // FUN_14030fd60
-pub(crate) const RVA_ARG_SLOT: usize = 0x0009_7920; // FUN_140097920
-pub(crate) const RVA_PUSH_STRING: usize = 0x0009_7f60; // FUN_140097f60
-pub(crate) const RVA_CREATE_TABLE: usize = 0x000b_a830; // FUN_1400ba830
-pub(crate) const RVA_RAWSETI: usize = 0x0009_8570; // FUN_140098570
-pub(crate) const RVA_REGISTER_TABLE: usize = 0x001e_22d0; // FUN_1401e22d0
-pub(crate) const RVA_STRING_ALLOC: usize = 0x0017_cbb0; // FUN_14017cbb0
-pub(crate) const RVA_STRING_FILL: usize = 0x0099_d3b0; // FUN_14099d3b0
-pub(crate) const RVA_BASE_TEMP: usize = 0x0031_00a0; // FUN_1403100a0(pos, windField, weatherGrid, ignored, waterFlag) -> ambient
-pub(crate) const RVA_RAYCAST: usize = 0x001a_4160; // FUN_1401a4160(ctx,seg6d,out_hit,out_obj,grp,mask)->bool
-pub(crate) const RVA_FIRES_BUILD: usize = 0x0030_a2f0; // FUN_14030a2f0 fire vertex builder (holder owns the fires ring)
+pub(crate) const RVA_LUA_SCREEN_INIT: usize = 0x002e_7740; // FUN_1402e5230
+pub(crate) const RVA_TEMPERATURE: usize = 0x0031_22b0; // FUN_14030fd60
+pub(crate) const RVA_ARG_SLOT: usize = 0x0009_7910; // FUN_140097920
+pub(crate) const RVA_PUSH_STRING: usize = 0x0009_7f50; // FUN_140097f60
+pub(crate) const RVA_CREATE_TABLE: usize = 0x000b_a820; // FUN_1400ba830
+pub(crate) const RVA_RAWSETI: usize = 0x0009_8560; // FUN_140098570
+pub(crate) const RVA_REGISTER_TABLE: usize = 0x001e_6330; // FUN_1401e22d0
+pub(crate) const RVA_STRING_ALLOC: usize = 0x0017_ca10; // FUN_14017cbb0
+pub(crate) const RVA_STRING_FILL: usize = 0x009a_0cf0; // FUN_14099d3b0
+pub(crate) const RVA_BASE_TEMP: usize = 0x0031_25f0; // FUN_1403100a0(pos, windField, weatherGrid, ignored, waterFlag) -> ambient
+pub(crate) const RVA_RAYCAST: usize = 0x001a_4010; // FUN_1401a4160(ctx,seg6d,out_hit,out_obj,grp,mask)->bool
+pub(crate) const RVA_FIRES_BUILD: usize = 0x0030_c800; // FUN_14030a2f0 fire vertex builder (holder owns the fires ring)
 // scene_vehicle_update: once per sim tick on the update thread, rcx = c_scene (0x5E85E0 was load-only).
-pub(crate) const RVA_SCENE_TICK: usize = 0x005e_8fb0;
-pub(crate) const RVA_SETTINGS: usize = 0x0029_4520; // FUN_140294520() -> settings singleton ([0] = day length, minutes)
-pub(crate) const RVA_FRAME_UNIFORMS: usize = 0x006b_b400; // FUN_1406bb400 render-thread uniform fill; arg2 = the scene object
+pub(crate) const RVA_SCENE_TICK: usize = 0x005e_bcf0;
+pub(crate) const RVA_SETTINGS: usize = 0x0029_6940; // FUN_140294520() -> settings singleton ([0] = day length, minutes)
+pub(crate) const RVA_FRAME_UNIFORMS: usize = 0x006b_e180; // FUN_1406bb400 render-thread uniform fill; arg2 = the scene object
 pub(crate) const FRAME_UNIFORMS_PROLOGUE: [u8; 32] = [
     0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xac,
-    0x24, 0xc8, 0x77, 0xff, 0xff, 0xb8, 0x58, 0x89, 0x00, 0x00, 0xe8, 0xf1, 0x77, 0x31, 0x00, 0x48,
+    0x24, 0xc8, 0x77, 0xff, 0xff, 0xb8, 0x58, 0x89, 0x00, 0x00, 0xe8, 0x41, 0x86, 0x31, 0x00, 0x48,
 ];
 // The game's exhaust-plume emitters: every engine type creates them through
 // FUN_140306740(manager, out_handle, effect_index) and updates them each tick
@@ -56,7 +56,7 @@ pub(crate) const FRAME_UNIFORMS_PROLOGUE: [u8; 32] = [
 // Both take (component, ?, ?, ?, world_matrix, origin, ...): all four register
 // arguments are integer-class (param_4 is stored from R9), so a detour can
 // declare every argument usize with no float-register hazard.
-pub(crate) const RVA_ROCKET_TICK: usize = 0x0043_7570; // FUN_140437570
+pub(crate) const RVA_ROCKET_TICK: usize = 0x0043_9df0; // FUN_140437570
 pub(crate) const ROCKET_TICK_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
     0x41, 0x57, 0x48, 0x8d, 0xa8, 0x48, 0xfb, 0xff, 0xff, 0x48, 0x81, 0xec, 0x80, 0x05, 0x00, 0x00,
@@ -68,7 +68,7 @@ pub(crate) const ROCKET_TICK_PROLOGUE: [u8; 32] = [
 // component in RCX and compute their exhaust world position into the component
 // at +0x390 as three doubles, so the detours read the position there instead of
 // transforming the tick's matrix argument.
-pub(crate) const RVA_PRESET_ENGINE_TICK: usize = 0x0034_ba00; // FUN_14034ba00
+pub(crate) const RVA_PRESET_ENGINE_TICK: usize = 0x0034_df80; // FUN_14034ba00
 /// Verified in game: the preset engine block keeps its temperature in Celsius
 /// at +0x1d8 - it read 11.8 C cold and 43.7 C running at 0.133 throttle, which
 /// matches the temperature the game itself displays for the block.
@@ -103,7 +103,7 @@ pub(crate) const PRESET_ENGINE_TICK_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
     0x41, 0x57, 0x48, 0x8d, 0xa8, 0x48, 0xfe, 0xff, 0xff, 0x48, 0x81, 0xec, 0x80, 0x02, 0x00, 0x00,
 ];
-pub(crate) const RVA_MODULAR_ENGINE_TICK: usize = 0x0044_9670; // FUN_140449670
+pub(crate) const RVA_MODULAR_ENGINE_TICK: usize = 0x0044_bef0; // FUN_140449670
 pub(crate) const MODULAR_ENGINE_TICK_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x70, 0x18, 0x55, 0x57, 0x41, 0x54, 0x41,
     0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x58, 0xfe, 0xff, 0xff, 0x48, 0x81, 0xec, 0x80, 0x02, 0x00,
@@ -113,12 +113,12 @@ pub(crate) const MODULAR_ENGINE_TICK_PROLOGUE: [u8; 32] = [
 // heat-relevant ones are probed: the water class (0x140b08f18) and the steam
 // class (0x140af6dc8). Both ticks take the component in RCX like the engine
 // ticks.
-pub(crate) const RVA_WATER_TICK: usize = 0x003e_f860; // FUN_1403ef860
+pub(crate) const RVA_WATER_TICK: usize = 0x003f_1fa0; // FUN_1403ef860
 pub(crate) const WATER_TICK_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
     0x41, 0x57, 0x48, 0x8d, 0xa8, 0x98, 0xf9, 0xff, 0xff, 0x48, 0x81, 0xec, 0x30, 0x07, 0x00, 0x00,
 ];
-pub(crate) const RVA_STEAM_TICK: usize = 0x0040_cbd0; // FUN_14040cbd0
+pub(crate) const RVA_STEAM_TICK: usize = 0x0040_f3a0; // FUN_14040cbd0
 pub(crate) const STEAM_TICK_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
     0x41, 0x57, 0x48, 0x8d, 0xa8, 0xf8, 0xfb, 0xff, 0xff, 0x48, 0x81, 0xec, 0xd0, 0x04, 0x00, 0x00,
@@ -128,7 +128,7 @@ pub(crate) const STEAM_TICK_PROLOGUE: [u8; 32] = [
 pub(crate) const DIESEL_T_MIN_C: f64 = 80.0;
 pub(crate) const DIESEL_T_MAX_C: f64 = 520.0;
 
-pub(crate) const RVA_JET_TICK: usize = 0x0035_0f40; // FUN_140350f40
+pub(crate) const RVA_JET_TICK: usize = 0x0035_34c0; // FUN_140350f40
 pub(crate) const JET_TICK_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
     0x41, 0x57, 0x48, 0x8d, 0xa8, 0x08, 0xfe, 0xff, 0xff, 0x48, 0x81, 0xec, 0xc0, 0x02, 0x00, 0x00,
@@ -203,7 +203,7 @@ pub(crate) const JET_RPS_TYPICAL: f64 = 10.0;
 /// Spool speed treated as full power. Jets destroy themselves somewhere past
 /// 100 RPS, so 100 is the natural "full" reference. Single tunable.
 pub(crate) const JET_RPS_FULL: f64 = 100.0;
-pub(crate) const RVA_EXHAUST_UPDATE: usize = 0x0030_2bb0; // FUN_140302bb0(emitter, world_pos, ..., rate, ...)
+pub(crate) const RVA_EXHAUST_UPDATE: usize = 0x0030_50c0; // FUN_140302bb0(emitter, world_pos, ..., rate, ...)
 pub(crate) const EXHAUST_UPDATE_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x18, 0x4c, 0x89, 0x48, 0x20, 0x55, 0x56, 0x57, 0x41, 0x54,
     0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xec, 0xe0, 0x00, 0x00, 0x00, 0x0f, 0x29, 0x70,
@@ -218,8 +218,8 @@ pub(crate) const EMITTER_MIN_RATE: f64 = 0.002;
 pub(crate) const EXHAUST_T_PLUME: f64 = 500.0; // 2/4/6
 pub(crate) const EXHAUST_T_DAMAGE: f64 = 800.0; // 3/5/7 - the kill field
 pub(crate) const EXHAUST_T_ROCKET: f64 = 900.0; // 41/42
-pub(crate) const RVA_SUNROT: usize = 0x002bf_9e0; // FUN_1402bf9e0(day_percent_f32, dir3_out, mat_out) — the game's rotating sun
-pub(crate) const RVA_SUN_UPDATE: usize = 0x005e_3270; // FUN_1405e3270(ctx, day_percent, flags, out) — per-tick sun update; out+0x198 = sun sprite world position
+pub(crate) const RVA_SUNROT: usize = 0x002c_1ef0; // FUN_1402bf9e0(day_percent_f32, dir3_out, mat_out) — the game's rotating sun
+pub(crate) const RVA_SUN_UPDATE: usize = 0x005e_6030; // FUN_1405e3270(ctx, day_percent, flags, out) — per-tick sun update; out+0x198 = sun sprite world position
 pub(crate) const SUN_UPDATE_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0x6c,
     0x24, 0xb0, 0x48, 0x81, 0xec, 0x50, 0x01, 0x00, 0x00, 0x0f, 0x29, 0x70, 0xb8, 0x0f, 0x29, 0x78,
@@ -252,7 +252,7 @@ pub(crate) const FIRES_PROLOGUE: [u8; 32] = [
 ];
 pub(crate) const SETTINGS_PROLOGUE: [u8; 32] = [
     0x48, 0x83, 0xec, 0x28, 0xba, 0x04, 0x00, 0x00, 0x00, 0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0x00,
-    0x00, 0x00, 0x48, 0x8b, 0x08, 0x8b, 0x04, 0x0a, 0x39, 0x05, 0xa6, 0x8c, 0xa6, 0x00, 0x7e, 0x33,
+    0x00, 0x00, 0x48, 0x8b, 0x08, 0x8b, 0x04, 0x0a, 0x39, 0x05, 0xde, 0x96, 0xa6, 0x00, 0x7e, 0x33,
 ];
 pub(crate) const SCENE_TICK_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48,
@@ -266,7 +266,7 @@ pub(crate) const SCENE_TICK_PROLOGUE: [u8; 32] = [
 /// Tonemap pass: `fastcall(mat_set, view, params* a3)` — 3 integer-class
 /// arguments, void return (verified by disassembly). `a3+0x00` is `color_mode`,
 /// non-zero for a view that has IR enabled.
-pub(crate) const RVA_TONEMAP: usize = 0x0068_b8c0; // FUN_14068b8c0
+pub(crate) const RVA_TONEMAP: usize = 0x0068_e640; // FUN_14068b8c0
 pub(crate) const TONEMAP_PROLOGUE: [u8; 24] = [
     0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
     0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x50,
@@ -278,13 +278,13 @@ pub(crate) const VIEW_STATE_TONEMAP_PARAMS: usize = 0x870;
 /// view state which is freed every frame.
 pub(crate) const VIEW_STATE_RT_HOLDER: usize = 0x828;
 /// `c_scene_vehicle_component_camera` vtable (RVA); validates a camera pointer.
-pub(crate) const RVA_CAMERA_VTABLE: usize = 0x00b5_3420;
+pub(crate) const RVA_CAMERA_VTABLE: usize = 0x00b5_d5d0;
 /// `0x68BB00 draw_fullscreen_quad_tex5`: its single `glDrawElements` (at
 /// `0x68BC6A`, through the IAT slot `0x140A935F8`) returns into
 /// `[0x68BB00, 0x68BCA0)`; the next function starts at `0x68BCA0`. That draw
 /// is the tonemap quad, i.e. where the IR composite replaces the graded image.
-pub(crate) const RVA_TONEMAP_QUAD: usize = 0x0068_bb00;
-pub(crate) const RVA_TONEMAP_QUAD_END: usize = 0x0068_bca0;
+pub(crate) const RVA_TONEMAP_QUAD: usize = 0x0068_e880;
+pub(crate) const RVA_TONEMAP_QUAD_END: usize = 0x0068_ea20;
 /// Mesh object: `+0x60` VBO, `+0x64` GL IBO id (u32). Chunk meshes are looked
 /// up by their index buffer in the draw thunk (mesh = `*(*(element))+8`).
 pub(crate) const MESH_IBO: usize = 0x64;
@@ -293,28 +293,28 @@ pub(crate) const MESH_IBO: usize = 0x64;
 // programs: the draw thunk sees every submitted draw, the matrix upload thunk
 // captures `mat_view_proj`/`mat_world`, and the framebuffer bind thunk finds
 // the G-buffer.
-pub(crate) const RVA_GL_DRAW_ELEMENTS: usize = 0x00a9_35f8;
-pub(crate) const RVA_GL_UNIFORM_MATRIX4FV: usize = 0x00ce_3268;
-pub(crate) const RVA_GL_BIND_FRAMEBUFFER: usize = 0x00ce_5688;
+pub(crate) const RVA_GL_DRAW_ELEMENTS: usize = 0x00a9_6658;
+pub(crate) const RVA_GL_UNIFORM_MATRIX4FV: usize = 0x00ce_61c8;
+pub(crate) const RVA_GL_BIND_FRAMEBUFFER: usize = 0x00ce_85e8;
 // GLEW dispatch slots used only to TRACK GL state (no driver query in the draw
 // hot path). Found from glewInit's `lea rcx,"glXxx"; call wglGetProcAddress;
 // mov [slot],rax` sequences (0x140995EFB, 0x140995623, 0x140994AA6, 0x140987156).
-pub(crate) const RVA_GL_USE_PROGRAM: usize = 0x00ce_3280;
+pub(crate) const RVA_GL_USE_PROGRAM: usize = 0x00ce_61e0;
 /// GLEW slot of `glUniform1f` (string xref, see RE notes).
-pub(crate) const RVA_GL_UNIFORM1F: usize = 0x00ce_30a8;
+pub(crate) const RVA_GL_UNIFORM1F: usize = 0x00ce_6008;
 /// GLEW slot of `glUniform3f` (light_pass_uniforms 0x1406842B0).
-pub(crate) const RVA_GL_UNIFORM3F: usize = 0x00ce_3168;
-pub(crate) const RVA_GL_BIND_BUFFER: usize = 0x00ce_83e8;
-pub(crate) const RVA_GL_ACTIVE_TEXTURE: usize = 0x00ce_7850;
-pub(crate) const RVA_GL_BIND_VERTEX_ARRAY: usize = 0x00ce_7270;
+pub(crate) const RVA_GL_UNIFORM3F: usize = 0x00ce_60c8;
+pub(crate) const RVA_GL_BIND_BUFFER: usize = 0x00ce_b348;
+pub(crate) const RVA_GL_ACTIVE_TEXTURE: usize = 0x00ce_a7b0;
+pub(crate) const RVA_GL_BIND_VERTEX_ARRAY: usize = 0x00ce_a1d0;
 /// IAT slot of `glViewport` (OPENGL32 import; `objdump -p` import table).
-pub(crate) const RVA_GL_VIEWPORT: usize = 0x00a9_3650;
+pub(crate) const RVA_GL_VIEWPORT: usize = 0x00a9_6738;
 /// OPENGL32 IAT glBindTexture (objdump -p).
-pub(crate) const RVA_GL_BIND_TEXTURE: usize = 0x00a9_3678;
+pub(crate) const RVA_GL_BIND_TEXTURE: usize = 0x00a9_6710;
 // Camera component fields (from the camera serializer).
 pub(crate) const CAMERA_PIVOT: usize = 0x680;
 // Scene / body containers for the per-frame mesh -> body map.
-pub(crate) const SCENE_VEHICLE_CONTAINER: usize = 0x4988;
+pub(crate) const SCENE_VEHICLE_CONTAINER: usize = 0x4990;
 pub(crate) const SCENE_VEHICLE_SET: usize = 0x320;
 pub(crate) const BODY_CHUNK_ITEMS: usize = 0x540;
 /// Second (pass-B) chunk table, same layout as `BODY_CHUNK_ITEMS` (re_chunks).

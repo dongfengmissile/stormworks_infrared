@@ -123,8 +123,8 @@ pub(crate) fn variant_args(i: usize) -> [usize; 8] {
 const WORLD_HEAT_FIELD: usize = 0xbaef0;
 const WORLD_WIND_FIELD: usize = 0x68a0;
 const WORLD_WEATHER: usize = 0xbade8;
-const WORLD_ENV_LIST: usize = 0x4ce0;
-const WORLD_PROVIDER: usize = 0x4988;
+const WORLD_ENV_LIST: usize = 0x4ce8;
+const WORLD_PROVIDER: usize = 0x4990;
 
 /// Water flag the game's callers pass for a craft/interior position (1), which
 /// is where a seeker camera or a vehicle body always sits.
@@ -197,8 +197,8 @@ pub(crate) unsafe fn world() -> Option<usize> {
             (0usize, WORLD_HEAT_FIELD, "temperature arg2 - 0xbaef0"),
             (1, WORLD_WIND_FIELD, "temperature arg3 - 0x68a0"),
             (2, WORLD_WEATHER, "temperature arg4 - 0xbade8"),
-            (3, WORLD_ENV_LIST, "temperature arg5 - 0x4ce0"),
-            (5, WORLD_PROVIDER, "temperature arg7 - 0x4988"),
+            (3, WORLD_ENV_LIST, "temperature arg5 - 0x4ce8"),
+            (5, WORLD_PROVIDER, "temperature arg7 - 0x4990"),
         ] {
             if args[index] >= field + PTR_MIN && world_ok(args[index] - field) {
                 hit = Some((args[index] - field, name));
