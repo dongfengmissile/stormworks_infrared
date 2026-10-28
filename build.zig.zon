@@ -1,0 +1,21 @@
+.{
+    .name = .stormworks_infrared,
+    .version = "0.1.0",
+    .fingerprint = 0x5c4e1a2b9d3f7e61, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // The hooking engine: the same C library the Rust `minhook` crate wraps,
+        // compiled here with Zig's C compiler (see build.zig).
+        .minhook = .{
+            .url = "https://github.com/TsudaKageyu/minhook/archive/8af6b4acae5a9388fd742b56fa79ece89d96f823.tar.gz",
+            .hash = "N-V-__8AACcyBQChOAHl-1-qhCH58hEggBX3glJ98OzZdZzn",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
