@@ -1,0 +1,120 @@
+name: Build Windows packages
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.profile }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: dev
+            directory: debug
+            archive: stormworks_infrared_debug.zip
+          - profile: release
+            directory: release
+            archive: stormworks_infrared.zip
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+      CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+      AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Windows cross compiler and Rust
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-mingw-w64-x86-64 zip
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
+
+      - name: Build DLL and injector
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          cargo +stable build --locked --target x86_64-pc-windows-gnu \
+            --profile "$PROFILE" --lib --bin infrared_inject
+
+      - name: Package DLL and EXE only
+        env:
+          BUILD_DIRECTORY: ${{ matrix.directory }}
+          ARCHIVE_NAME: ${{ matrix.archive }}
+        run: |
+          mkdir -p package dist
+          cp "target/x86_64-pc-windows-gnu/$BUILD_DIRECTORY/StormworksInfrared.dll" package/
+          cp "target/x86_64-pc-windows-gnu/$BUILD_DIRECTORY/infrared_inject.exe" package/
+          cd package
+          zip "../dist/$ARCHIVE_NAME" StormworksInfrared.dll infrared_inject.exe
+
+      - name: Upload build ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: packaged-${{ matrix.directory }}-${{ github.sha }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  publish:
+    name: Update latest-build prerelease
+    needs: build
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-latest-build
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_SHA: ${{ github.sha }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      BUILD_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: packaged-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the newest default-branch build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Keep superseded builds as artifacts without replacing the prerelease.
+          current_sha=$(gh api "repos/$GH_REPO/git/ref/heads/$DEFAULT_BRANCH" --jq .object.sha)
+          if [[ "$current_sha" != "$BUILD_SHA" ]]; then
+            echo "A newer commit exists; skipping prerelease update."
+            exit 0
+          fi
+
+          printf 'Automatic Windows GNU builds of commit %s.\n\nWorkflow: %s\n\nRelease: minimal logging. Debug: diagnostic logging enabled.\n' \
+            "$BUILD_SHA" "$BUILD_URL" > notes.md
+
+          if gh release view latest-build >/dev/null 2>&1; then
+            gh api --method PATCH "repos/$GH_REPO/git/refs/tags/latest-build" \
+              -f sha="$BUILD_SHA" -F force=true
+            gh release upload latest-build dist/stormworks_infrared.zip dist/stormworks_infrared_debug.zip --clobber
+            # Clean up assets uploaded by the earlier workflow variants.
+            while IFS= read -r asset; do
+              case "$asset" in
+                StormworksInfrared.dll|infrared_inject.exe|stormworks-infrared-release.zip|stormworks-infrared-debug.zip)
+                  gh release delete-asset latest-build "$asset" --yes ;;
+              esac
+            done < <(gh release view latest-build --json assets --jq '.assets[].name')
+            gh release edit latest-build --title "Latest development build" \
+              --prerelease --latest=false --notes-file notes.md
+          else
+            gh release create latest-build dist/stormworks_infrared.zip dist/stormworks_infrared_debug.zip --target "$BUILD_SHA" \
+              --title "Latest development build" --prerelease --latest=false \
+              --notes-file notes.md
+          fi
