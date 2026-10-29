@@ -4,8 +4,8 @@
 
 /// Build this DLL was relocated against.
 /// stormworks64.exe sha256:
-/// f7d605e34fe3b8ebde3adbc8e2e90fe28821c6cb3ef67be79abe58ce652968a0 (v1.15.25; offsets mapped from f9206d85c82f, see stormworks_idapro/new/UPDATE_MAP.md)
-pub(crate) const GAME_BUILD_LABEL: &str = "f7d605e34fe3";
+/// c38c03ff756b4f42bbc9f11cdbb034977ad0f968e45741c5cf410732f22a338d (v1.15.25 hotfix; mapped from f7d605e34fe3 by .pdata index + RTTI, see docs/RE_NOTES.md)
+pub(crate) const GAME_BUILD_LABEL: &str = "c38c03ff756b";
 
 /// Unique stamp of THIS plugin binary (unix seconds at compile time), logged
 /// at bootstrap. On-disk checksums cannot tell you what a running game has
@@ -27,17 +27,17 @@ pub(crate) const RVA_CREATE_TABLE: usize = 0x000b_a820; // FUN_1400ba830
 pub(crate) const RVA_RAWSETI: usize = 0x0009_8560; // FUN_140098570
 pub(crate) const RVA_REGISTER_TABLE: usize = 0x001e_6330; // FUN_1401e22d0
 pub(crate) const RVA_STRING_ALLOC: usize = 0x0017_ca10; // FUN_14017cbb0
-pub(crate) const RVA_STRING_FILL: usize = 0x009a_0cf0; // FUN_14099d3b0
+pub(crate) const RVA_STRING_FILL: usize = 0x009a_0db0; // FUN_14099d3b0
 pub(crate) const RVA_BASE_TEMP: usize = 0x0031_25f0; // FUN_1403100a0(pos, windField, weatherGrid, ignored, waterFlag) -> ambient
 pub(crate) const RVA_RAYCAST: usize = 0x001a_4010; // FUN_1401a4160(ctx,seg6d,out_hit,out_obj,grp,mask)->bool
 pub(crate) const RVA_FIRES_BUILD: usize = 0x0030_c800; // FUN_14030a2f0 fire vertex builder (holder owns the fires ring)
 // scene_vehicle_update: once per sim tick on the update thread, rcx = c_scene (0x5E85E0 was load-only).
-pub(crate) const RVA_SCENE_TICK: usize = 0x005e_bcf0;
+pub(crate) const RVA_SCENE_TICK: usize = 0x005e_bd20;
 pub(crate) const RVA_SETTINGS: usize = 0x0029_6940; // FUN_140294520() -> settings singleton ([0] = day length, minutes)
-pub(crate) const RVA_FRAME_UNIFORMS: usize = 0x006b_e180; // FUN_1406bb400 render-thread uniform fill; arg2 = the scene object
+pub(crate) const RVA_FRAME_UNIFORMS: usize = 0x006b_e1b0; // FUN_1406bb400 render-thread uniform fill; arg2 = the scene object
 pub(crate) const FRAME_UNIFORMS_PROLOGUE: [u8; 32] = [
     0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xac,
-    0x24, 0xc8, 0x77, 0xff, 0xff, 0xb8, 0x58, 0x89, 0x00, 0x00, 0xe8, 0x41, 0x86, 0x31, 0x00, 0x48,
+    0x24, 0xc8, 0x77, 0xff, 0xff, 0xb8, 0x58, 0x89, 0x00, 0x00, 0xe8, 0xd1, 0x86, 0x31, 0x00, 0x48,
 ];
 // The game's exhaust-plume emitters: every engine type creates them through
 // FUN_140306740(manager, out_handle, effect_index) and updates them each tick
@@ -219,7 +219,7 @@ pub(crate) const EXHAUST_T_PLUME: f64 = 500.0; // 2/4/6
 pub(crate) const EXHAUST_T_DAMAGE: f64 = 800.0; // 3/5/7 - the kill field
 pub(crate) const EXHAUST_T_ROCKET: f64 = 900.0; // 41/42
 pub(crate) const RVA_SUNROT: usize = 0x002c_1ef0; // FUN_1402bf9e0(day_percent_f32, dir3_out, mat_out) — the game's rotating sun
-pub(crate) const RVA_SUN_UPDATE: usize = 0x005e_6030; // FUN_1405e3270(ctx, day_percent, flags, out) — per-tick sun update; out+0x198 = sun sprite world position
+pub(crate) const RVA_SUN_UPDATE: usize = 0x005e_6060; // FUN_1405e3270(ctx, day_percent, flags, out) — per-tick sun update; out+0x198 = sun sprite world position
 pub(crate) const SUN_UPDATE_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0x6c,
     0x24, 0xb0, 0x48, 0x81, 0xec, 0x50, 0x01, 0x00, 0x00, 0x0f, 0x29, 0x70, 0xb8, 0x0f, 0x29, 0x78,
@@ -252,7 +252,7 @@ pub(crate) const FIRES_PROLOGUE: [u8; 32] = [
 ];
 pub(crate) const SETTINGS_PROLOGUE: [u8; 32] = [
     0x48, 0x83, 0xec, 0x28, 0xba, 0x04, 0x00, 0x00, 0x00, 0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0x00,
-    0x00, 0x00, 0x48, 0x8b, 0x08, 0x8b, 0x04, 0x0a, 0x39, 0x05, 0xde, 0x96, 0xa6, 0x00, 0x7e, 0x33,
+    0x00, 0x00, 0x48, 0x8b, 0x08, 0x8b, 0x04, 0x0a, 0x39, 0x05, 0xee, 0x96, 0xa6, 0x00, 0x7e, 0x33,
 ];
 pub(crate) const SCENE_TICK_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48,
@@ -266,7 +266,7 @@ pub(crate) const SCENE_TICK_PROLOGUE: [u8; 32] = [
 /// Tonemap pass: `fastcall(mat_set, view, params* a3)` — 3 integer-class
 /// arguments, void return (verified by disassembly). `a3+0x00` is `color_mode`,
 /// non-zero for a view that has IR enabled.
-pub(crate) const RVA_TONEMAP: usize = 0x0068_e640; // FUN_14068b8c0
+pub(crate) const RVA_TONEMAP: usize = 0x0068_e670; // FUN_14068b8c0
 pub(crate) const TONEMAP_PROLOGUE: [u8; 24] = [
     0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
     0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x50,
@@ -278,13 +278,13 @@ pub(crate) const VIEW_STATE_TONEMAP_PARAMS: usize = 0x870;
 /// view state which is freed every frame.
 pub(crate) const VIEW_STATE_RT_HOLDER: usize = 0x828;
 /// `c_scene_vehicle_component_camera` vtable (RVA); validates a camera pointer.
-pub(crate) const RVA_CAMERA_VTABLE: usize = 0x00b5_d5d0;
+pub(crate) const RVA_CAMERA_VTABLE: usize = 0x00b5_d328;
 /// `0x68BB00 draw_fullscreen_quad_tex5`: its single `glDrawElements` (at
 /// `0x68BC6A`, through the IAT slot `0x140A935F8`) returns into
 /// `[0x68BB00, 0x68BCA0)`; the next function starts at `0x68BCA0`. That draw
 /// is the tonemap quad, i.e. where the IR composite replaces the graded image.
-pub(crate) const RVA_TONEMAP_QUAD: usize = 0x0068_e880;
-pub(crate) const RVA_TONEMAP_QUAD_END: usize = 0x0068_ea20;
+pub(crate) const RVA_TONEMAP_QUAD: usize = 0x0068_e8b0;
+pub(crate) const RVA_TONEMAP_QUAD_END: usize = 0x0068_ea50;
 /// Mesh object: `+0x60` VBO, `+0x64` GL IBO id (u32). Chunk meshes are looked
 /// up by their index buffer in the draw thunk (mesh = `*(*(element))+8`).
 pub(crate) const MESH_IBO: usize = 0x64;
@@ -294,25 +294,23 @@ pub(crate) const MESH_IBO: usize = 0x64;
 // captures `mat_view_proj`/`mat_world`, and the framebuffer bind thunk finds
 // the G-buffer.
 pub(crate) const RVA_GL_DRAW_ELEMENTS: usize = 0x00a9_6658;
-pub(crate) const RVA_GL_UNIFORM_MATRIX4FV: usize = 0x00ce_61c8;
-pub(crate) const RVA_GL_BIND_FRAMEBUFFER: usize = 0x00ce_85e8;
+pub(crate) const RVA_GL_UNIFORM_MATRIX4FV: usize = 0x00ce_61d8;
+pub(crate) const RVA_GL_BIND_FRAMEBUFFER: usize = 0x00ce_85f8;
 // GLEW dispatch slots used only to TRACK GL state (no driver query in the draw
 // hot path). Found from glewInit's `lea rcx,"glXxx"; call wglGetProcAddress;
 // mov [slot],rax` sequences (0x140995EFB, 0x140995623, 0x140994AA6, 0x140987156).
-pub(crate) const RVA_GL_USE_PROGRAM: usize = 0x00ce_61e0;
+pub(crate) const RVA_GL_USE_PROGRAM: usize = 0x00ce_61f0;
 /// GLEW slot of `glUniform1f` (string xref, see RE notes).
-pub(crate) const RVA_GL_UNIFORM1F: usize = 0x00ce_6008;
+pub(crate) const RVA_GL_UNIFORM1F: usize = 0x00ce_6018;
 /// GLEW slot of `glUniform3f` (light_pass_uniforms 0x1406842B0).
-pub(crate) const RVA_GL_UNIFORM3F: usize = 0x00ce_60c8;
-pub(crate) const RVA_GL_BIND_BUFFER: usize = 0x00ce_b348;
-pub(crate) const RVA_GL_ACTIVE_TEXTURE: usize = 0x00ce_a7b0;
-pub(crate) const RVA_GL_BIND_VERTEX_ARRAY: usize = 0x00ce_a1d0;
+pub(crate) const RVA_GL_UNIFORM3F: usize = 0x00ce_60d8;
+pub(crate) const RVA_GL_BIND_BUFFER: usize = 0x00ce_b358;
+pub(crate) const RVA_GL_ACTIVE_TEXTURE: usize = 0x00ce_a7c0;
+pub(crate) const RVA_GL_BIND_VERTEX_ARRAY: usize = 0x00ce_a1e0;
 /// IAT slot of `glViewport` (OPENGL32 import; `objdump -p` import table).
 pub(crate) const RVA_GL_VIEWPORT: usize = 0x00a9_6738;
 /// OPENGL32 IAT glBindTexture (objdump -p).
 pub(crate) const RVA_GL_BIND_TEXTURE: usize = 0x00a9_6710;
-// Camera component fields (from the camera serializer).
-pub(crate) const CAMERA_PIVOT: usize = 0x680;
 // Scene / body containers for the per-frame mesh -> body map.
 pub(crate) const SCENE_VEHICLE_CONTAINER: usize = 0x4990;
 pub(crate) const SCENE_VEHICLE_SET: usize = 0x320;
@@ -341,8 +339,6 @@ pub(crate) const FLIR_TEXTURE_UNIT: u32 = 7;
 pub(crate) const FLIR_UPLOAD_INTERVAL_FRAMES: u64 = 2;
 /// Upper bound on cached body volumes before unused ones are evicted.
 pub(crate) const FLIR_GRID_TEXTURE_MAX: usize = 128;
-/// A registered FLIR camera not refreshed for this long is no longer sampled for ambient.
-pub(crate) const FLIR_IR_CAMERA_STALE_MS: u64 = 2000;
 /// A tonemap output target that no scene submit refreshed for this long is
 /// dropped (with its G-buffer pairing): at one frame per view it only outlives a
 /// view that stopped rendering, and a recycled framebuffer id is never trusted.

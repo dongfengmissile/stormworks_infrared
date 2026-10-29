@@ -132,9 +132,9 @@ pub(crate) unsafe fn register_ir_screen_table(state: usize) {
 // ---------------------------------------------------------------------------
 
 /// `c_scene_vehicle_component_camera` vtable.
-const CAMERA_VTABLE_RVA: usize = 0x00b5_d5d0;
+const CAMERA_VTABLE_RVA: usize = 0x00b5_d328;
 /// `c_vehicle_logic_slot_output_video::vftable` - a camera's video output slot.
-const SLOT_OUTPUT_VIDEO_VTABLE_RVA: usize = 0x00b7_eb08;
+const SLOT_OUTPUT_VIDEO_VTABLE_RVA: usize = 0x00b7_eaa0;
 /// The microcontroller's embedded `c_microprocessor_lua_script`.
 const MC_SCRIPT_OFFSET: usize = 0x660;
 /// `node+0x28` / `node+0x30` of the MC's video input node (`comp+0x110`): the
@@ -176,11 +176,11 @@ unsafe fn mc_component(lua: usize) -> Option<usize> {
 }
 
 /// Vtable RVAs of the MC graph objects (RE_NOTES §1.7.3).
-const LUA_SCRIPT_VTABLE_RVA: usize = 0x00b7_9410; // c_microprocessor_lua_script
-const LUA_BLOCK_VTABLE_RVA: usize = 0x00ba_63f8; // c_microprocessor_component_lua_script
-const OUT_VIDEO_NODE_VTABLE_RVA: usize = 0x00b0_2648; // ..._logic_node_output_video
-const BRIDGE_VIDEO_IN_VTABLE_RVA: usize = 0x00b1_1d60; // ..._bridge_video_input
-const VIDEO_SWITCHBOX_VTABLE_RVA: usize = 0x00b8_d7c8; // ..._video_switchbox
+const LUA_SCRIPT_VTABLE_RVA: usize = 0x00b7_9580; // c_microprocessor_lua_script
+const LUA_BLOCK_VTABLE_RVA: usize = 0x00ba_6640; // c_microprocessor_component_lua_script
+const OUT_VIDEO_NODE_VTABLE_RVA: usize = 0x00b0_25a8; // ..._logic_node_output_video
+const BRIDGE_VIDEO_IN_VTABLE_RVA: usize = 0x00b1_1ce0; // ..._bridge_video_input
+const VIDEO_SWITCHBOX_VTABLE_RVA: usize = 0x00b8_d5f8; // ..._video_switchbox
 /// Input node fields: source slot / source (graph) output node.
 const NODE_SRC_NODE: usize = 0x30;
 /// bridge_video_input's in-node (+0x50); switchbox in-nodes at +0x50 and +0x2A8.
@@ -199,11 +199,11 @@ unsafe fn rd(p: usize) -> Option<usize> {
 }
 
 const MC_GROUP: usize = 0x9a8;
-const GROUP_VTABLE_RVA: usize = 0x00b5_1380;
+const GROUP_VTABLE_RVA: usize = 0x00b5_13b0;
 const GROUP_IN_MC: usize = 0x1c0;
-const MC_COMP_VTABLE_RVA: usize = 0x00b8_fa40;
+const MC_COMP_VTABLE_RVA: usize = 0x00b8_f9c0;
 const MC_BODY: usize = 0x28;
-const MC_INPUT_SLOT_VTABLE_RVA: usize = 0x00b8_9390; // c_vehicle_logic_slot_input_video
+const MC_INPUT_SLOT_VTABLE_RVA: usize = 0x00b8_9300; // c_vehicle_logic_slot_input_video
 const BRIDGE_INSLOT: usize = 0x78;
 const BODY_COMPONENTS: usize = 0x3f0; // ring: ptr, +8 cap, +0xC off, +0x10 n
 const BODY_VEHICLE: usize = 0x250;

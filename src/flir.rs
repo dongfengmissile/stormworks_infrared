@@ -54,7 +54,7 @@ use windows_sys::Win32::System::Memory::{
 use crate::fault::{self, stage};
 use crate::logging::{log_line, log_once};
 use crate::memory::{
-    bytes_match, image_backed, read_f64_at, read_u32_at, read_usize_at, readable,
+    bytes_match, image_backed, read_u32_at, read_usize_at, readable,
     PTR_MIN,
 };
 use crate::offsets::*;
@@ -1270,36 +1270,6 @@ fn log_once_key(key: u64, message: impl FnOnce() -> String) {
 static F10_ON: AtomicBool = AtomicBool::new(false);
 static KEY_HELD: AtomicBool = AtomicBool::new(false);
 
-/// Cameras whose IR latch was seen set, newest tick wins. Each one keeps the
-/// ambient temperature last sampled at its own pivot, so a view reads its own
-/// camera's ambient instead of whichever camera ticked last.
-const CAMERA_SLOTS: usize = 4;
-
-struct CameraSlot {
-    pointer: AtomicUsize,
-    ambient_bits: AtomicU32,
-    ambient_valid: AtomicBool,
-    tick_ms: AtomicU64,
-}
-
-impl CameraSlot {
-    const fn new() -> CameraSlot {
-        CameraSlot {
-            pointer: AtomicUsize::new(0),
-            ambient_bits: AtomicU32::new(0),
-            ambient_valid: AtomicBool::new(false),
-            tick_ms: AtomicU64::new(0),
-        }
-    }
-}
-
-static CAMERAS: [CameraSlot; CAMERA_SLOTS] = [
-    CameraSlot::new(),
-    CameraSlot::new(),
-    CameraSlot::new(),
-    CameraSlot::new(),
-];
-
 // One-shot diagnostic keys (verbose builds only, see `logging::log_once`).
 // `flir` owns bits 8..32 of the shared one-shot word; `blocktemp` owns 0..8.
 // Every message owns its own bit: a shared bit silently drops everything after
@@ -1665,46 +1635,6 @@ unsafe fn patch_gl_slot(slot: usize, ours: usize, original: &AtomicUsize, label:
 // Hooks
 // ---------------------------------------------------------------------------
 
-/// Record `camera` in the slot registry: its own slot, else an empty one, else
-/// the one that has been stale longest.
-fn register_camera(camera: usize, now: u64) {
-    let mut candidate: Option<usize> = None;
-    let mut candidate_ms = u64::MAX;
-    for (index, slot) in CAMERAS.iter().enumerate() {
-        let pointer = slot.pointer.load(Ordering::Relaxed);
-        if pointer == camera {
-            slot.tick_ms.store(now, Ordering::Relaxed);
-            return;
-        }
-        if pointer < 0x10000 {
-            candidate = Some(index);
-            break;
-        }
-        let tick = slot.tick_ms.load(Ordering::Relaxed);
-        if tick < candidate_ms {
-            candidate_ms = tick;
-            candidate = Some(index);
-        }
-    }
-    let Some(index) = candidate else { return };
-    let slot = &CAMERAS[index];
-    slot.pointer.store(camera, Ordering::Relaxed);
-    slot.tick_ms.store(now, Ordering::Relaxed);
-    slot.ambient_valid.store(false, Ordering::Relaxed);
-}
-
-/// Ambient temperature last sampled at `camera`'s own pivot.
-fn camera_ambient(camera: usize) -> f32 {
-    for slot in CAMERAS.iter() {
-        if slot.pointer.load(Ordering::Relaxed) == camera
-            && slot.ambient_valid.load(Ordering::Relaxed)
-        {
-            return f32::from_bits(slot.ambient_bits.load(Ordering::Relaxed));
-        }
-    }
-    FLIR_AMBIENT_FALLBACK_C
-}
-
 /// Scene ambient air temperature cached by `scene_tick` on the game thread (the
 /// median of the thermal sim's per-body ambient samples), or the fixed fallback
 /// when the sim has not stepped a body yet. Used by the main view (F10), which has
@@ -1785,9 +1715,10 @@ pub(crate) fn on_scene_submit(_scene: usize, view_state: usize, secondary: u8) {
             return;
         }
         if rsi == view_state {
-            if valid_camera(r15) {
-                MAIN_CAMERA.store(r15, Ordering::Relaxed);
-            }
+            // The game recomputes R15 every frame and leaves it null when the
+            // player is not looking through a camera, so clear on null: keeping
+            // the last camera left FLIR on after leaving a scope (issue #4).
+            MAIN_CAMERA.store(if valid_camera(r15) { r15 } else { 0 }, Ordering::Relaxed);
             return;
         }
         if !valid_camera(rbx) || !readable(view_state + VIEW_STATE_RT_HOLDER, 8) {
@@ -1829,10 +1760,8 @@ fn camera_for_params(params: usize) -> usize {
         .map_or(0, |(camera, _)| *camera)
 }
 
-/// Scene tick (game thread): the FLIR mesh -> body map, plus the ambient
-/// temperature at each registered camera's own pivot, so the render thread
-/// never calls into the heat model itself and every view can use its own
-/// camera's ambient.
+/// Scene tick (game thread): the FLIR mesh -> body map plus the ambient, sun and
+/// weather caches, so the render thread never calls into the heat model itself.
 pub(crate) fn scene_tick(scene: usize) {
     // A panic must never unwind through the `extern "C"` scene-tick detour.
     let _ = std::panic::catch_unwind(|| scene_tick_inner(scene));
@@ -1856,34 +1785,6 @@ fn scene_tick_inner(scene: usize) {
             MAP_REBUILD_MS.store(now, Ordering::Relaxed);
             let _stage = fault::enter(stage::FLIR_MESH_MAP);
             rebuild_mesh_body(scene);
-        }
-    }
-    let now = now_ms();
-    for slot in CAMERAS.iter() {
-        let camera = slot.pointer.load(Ordering::Relaxed);
-        if camera < 0x10000
-            || now.saturating_sub(slot.tick_ms.load(Ordering::Relaxed)) > FLIR_IR_CAMERA_STALE_MS
-        {
-            continue;
-        }
-        if !readable(camera + CAMERA_PIVOT, 24) {
-            continue;
-        }
-        let (x, y, z) = unsafe {
-            (
-                read_f64_at(camera + CAMERA_PIVOT),
-                read_f64_at(camera + CAMERA_PIVOT + 8),
-                read_f64_at(camera + CAMERA_PIVOT + 16),
-            )
-        };
-        if !(x.is_finite() && y.is_finite() && z.is_finite()) {
-            continue;
-        }
-        let ambient = unsafe { crate::heat::base_ambient_at((x, y, z)) };
-        if ambient.is_finite() {
-            slot.ambient_bits
-                .store(ambient.to_bits(), Ordering::Relaxed);
-            slot.ambient_valid.store(true, Ordering::Relaxed);
         }
     }
     // A view with no IR camera of its own (the F10 main view) uses the scene's
@@ -1979,7 +1880,6 @@ pub(crate) extern "C" fn ir_tonemap_hook(ctx: usize, view: usize, params: usize)
     let camera = std::panic::catch_unwind(|| {
         let camera = camera_for_params(params);
         if camera >= PTR_MIN && flir_enabled_cfg(camera).is_some() {
-            register_camera(camera, now_ms());
             camera
         } else {
             0
@@ -5154,20 +5054,16 @@ learned at the tonemap quad; targets seen so far: {:?}); the game's tonemap is k
     };
 
     // Config comes from the camera the IR view's tonemap quad ran with (the
-    // newest IR-latched camera); the main view (F10) has no camera. Ambient is
-    // that camera's pivot temperature, else the scene median cached on the game
-    // thread (see `scene_tick`).
+    // newest IR-latched camera); the main view (F10) has no camera.
     let config = if camera >= PTR_MIN {
         camera_config(camera)
     } else {
         FlirCfg::default()
     };
     let (sun_dir, sun_valid) = sun_toward();
-    let ambient = if camera >= PTR_MIN {
-        camera_ambient(camera)
-    } else {
-        scene_ambient()
-    };
+    // camera+0x680 is the camera's serialized pivot, not a world position, so
+    // sampling there gave nonsense (-576 C, cold exhaust); air barely varies, use the scene's.
+    let ambient = scene_ambient();
 
     let _guard = CompositeGuard::begin(gl);
     (gl.use_program)(composite.program);
