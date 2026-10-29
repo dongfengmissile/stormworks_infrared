@@ -20,8 +20,10 @@ Requires the Rust toolchain and the GNU Windows cross target:
 
 ```
 rustup target add x86_64-pc-windows-gnu
-cargo build --target x86_64-pc-windows-gnu
+cargo build --target x86_64-pc-windows-gnu --features logging
 ```
+
+(without `--features logging` the debug build writes no diagnostics or crash records)
 
 or for the minimal logging release:
 
@@ -43,7 +45,7 @@ You should see a line in the log confirming the hooks installed and the `ir` tab
 <Stormworks install>/logs/infrared_bootstrap.log
 ```
 
-The debug build additionally carries a diagnostic dump: weather, sun, scan direction, source list, source position and more.
+The debug build (built with `--features logging`) additionally carries a diagnostic dump: weather, sun, scan direction, source list, source position and more.
 
 ## Lua API
 
