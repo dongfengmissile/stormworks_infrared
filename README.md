@@ -108,8 +108,10 @@ local cells, az_err, el_err, strength, flux, ambient, n_sources, id = ir.scan(
 A microcontroller LUA node whose **video input** is wired to a camera can turn FLIR on for that camera. The camera's own **Infrared Mode** is left alone and keeps working as the game renders it. Every vehicle block carries a simulated temperature, so a worn engine shows hot while a cold hull stays near ambient. Terrain and water sit at ambient plus sun soak; sky is cold.
 
 ```lua
-ir.flir(on)                                      -- bool
-ir.flir_config(r, g, b, black_hot, tmin, tmax)   -- presentation only
+function onTick() -- needs to run in onTick()
+    ir.flir(on) -- bool
+    ir.flir_config(r, g, b, black_hot, tmin, tmax) -- presentation only
+end
 ```
 
 | argument | meaning |
