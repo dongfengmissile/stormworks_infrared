@@ -19,9 +19,11 @@ jobs:
           - profile: dev
             directory: debug
             archive: stormworks_infrared_debug.zip
+            features: logging
           - profile: release
             directory: release
             archive: stormworks_infrared.zip
+            features: ""
     env:
       CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
       CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
@@ -38,9 +40,10 @@ jobs:
       - name: Build DLL and injector
         env:
           PROFILE: ${{ matrix.profile }}
+          FEATURES: ${{ matrix.features }}
         run: |
           cargo +stable build --locked --target x86_64-pc-windows-gnu \
-            --profile "$PROFILE" --lib --bin infrared_inject
+            --profile "$PROFILE" --features "$FEATURES" --lib --bin infrared_inject
 
       - name: Package DLL and EXE only
         env:
