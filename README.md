@@ -101,7 +101,7 @@ local cells, az_err, el_err, strength, flux, ambient, n_sources, id = ir.scan(
 A microcontroller LUA node whose video input is wired to a camera can turn FLIR on for that camera. Every vehicle block carries a simulated temperature, so a worn engine shows hot while a cold hull stays near ambient. **Needs to run in onTick() !!!**
 
 ```lua
-function onTick() -- needs to run in onTick()
+function onTick()
     ir.flir(on) -- bool
     ir.flir_config(r, g, b, black_hot, tmin, tmax) -- presentation only
 end

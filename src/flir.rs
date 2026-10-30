@@ -126,6 +126,9 @@ const GL_COLOR_WRITEMASK: u32 = 0x0c23;
 const GL_RGBA: u32 = 0x1908;
 const GL_READ_FRAMEBUFFER: u32 = 0x8ca8;
 const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8caa;
+const GL_SCISSOR_TEST: u32 = 0x0c11;
+const GL_RGBA16F: i32 = 0x881a;
+const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8cd5;
 
 // ---------------------------------------------------------------------------
 // GL entry points (resolved lazily on the GL thread, `opengl32` + wgl)
@@ -214,6 +217,11 @@ gl_table! {
     color_mask: unsafe extern "system" fn(u8, u8, u8, u8),
     read_pixels: unsafe extern "system" fn(i32, i32, i32, i32, u32, u32, *mut c_void),
     bind_framebuffer: unsafe extern "system" fn(u32, u32),
+    gen_framebuffers: unsafe extern "system" fn(i32, *mut u32),
+    framebuffer_texture_2d: unsafe extern "system" fn(u32, u32, u32, u32, i32),
+    check_framebuffer_status: unsafe extern "system" fn(u32) -> u32,
+    clear: unsafe extern "system" fn(u32),
+    clear_color: unsafe extern "system" fn(f32, f32, f32, f32),
     get_framebuffer_attachment_parameteriv: unsafe extern "system" fn(u32, u32, u32, *mut i32),
     get_tex_level_parameteriv: unsafe extern "system" fn(u32, i32, u32, *mut i32),
     get_vertex_attribiv: unsafe extern "system" fn(u32, u32, *mut i32),
@@ -634,6 +642,8 @@ uniform float ambient_c;      // sea-level air: terrain, water, people
 uniform float vehicle_air_c;  // air at the vehicles/camera
 uniform sampler2D tex_water;  // game's ocean-surface log depth (depth_ocean)
 uniform int has_water;
+uniform sampler2D texture_hud; // scope's Lua overlay (additive_hud capture)
+uniform int has_hud;
 uniform vec4 plume_a[8];      // jet plume start (render space), excess C
 uniform vec4 plume_b[8];      // unit flow direction, nozzle radius
 uniform int plume_n;
@@ -898,6 +908,10 @@ void main()
     v = max(v, sun_glow);
     // Black hot flips brightness inside the tint: hot = black, cold = full tint.
     color_out = vec4((black_hot == 1 ? 1.0 - v : v) * tint, 1.0);
+    // The game adds the Lua overlay to the HDR image before its tonemap; keep
+    // its own colours on top of the FLIR picture.
+    if (has_hud == 1)
+        color_out.rgb += texture(texture_hud, uv).rgb;
 }
 "#;
 
@@ -958,6 +972,8 @@ struct Composite {
     enc_max: i32,
     sky_c: i32,
     sky_depth_m: i32,
+    tex_hud: i32,
+    has_hud: i32,
     /// Attribute locations the program was linked with (the game tonemap's).
     pos_loc: u32,
     coord_loc: u32,
@@ -2299,6 +2315,8 @@ pub(crate) extern "system" fn gl_draw_elements_entry_rust(
             let replaced =
                 std::panic::catch_unwind(|| unsafe { tonemap_quad(pending == 2, camera, (mode, count, kind, indices)) })
                     .unwrap_or(false);
+            // The captured overlay belonged to this view only.
+            HUD_FRESH.store(false, Ordering::Relaxed);
             if replaced {
                 return;
             }
@@ -2325,6 +2343,143 @@ pub(crate) extern "system" fn gl_draw_elements_entry_rust(
     unsafe { f(mode, count, kind, indices) };
     if RESTORE_LF.load(Ordering::Relaxed) >= 0 {
         unsafe { restore_skinned_draw() };
+    }
+    if mode == GL_TRIANGLES
+        && kind == GL_UNSIGNED_SHORT
+        && (IR_WANTED.load(Ordering::Relaxed)
+            || (cfg!(debug_assertions) && F10_ON.load(Ordering::Relaxed)))
+        && !IN_SUBSTITUTE.load(Ordering::Acquire)
+    {
+        let _ = std::panic::catch_unwind(|| unsafe { capture_hud(mode, count, kind, indices) });
+    }
+}
+
+/// Plugin-owned copy of the scope's Lua overlay: (texture, FBO, size).
+static HUD_TARGET: Mutex<Option<(u32, u32, [i32; 2])>> = Mutex::new(None);
+/// The overlay texture holds this view's overlay (set by the first capture
+/// after a tonemap quad, cleared at every tonemap quad).
+static HUD_FRESH: AtomicBool = AtomicBool::new(false);
+static HUD_FAILED: AtomicBool = AtomicBool::new(false);
+/// Composite texture unit for the overlay (explicitly saved/restored).
+const HUD_UNIT: u32 = 4;
+
+/// `graphics/shaders/additive_hud` (the scope's Lua surface): the program with
+/// both `texture_overlay` and `multiply_color`. Cached per program id.
+unsafe fn is_hud_program(gl: &'static Gl, program: u32) -> bool {
+    static LAST: AtomicU64 = AtomicU64::new(0); // program << 1 | hud
+    let last = LAST.load(Ordering::Relaxed);
+    if last >> 1 == program as u64 {
+        return last & 1 == 1;
+    }
+    static SEEN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+    let hud = match seen.iter().find(|e| e.0 == program) {
+        Some(&(_, hud)) => hud,
+        None => {
+            let hud = uniform(gl, program, b"texture_overlay\0") >= 0
+                && uniform(gl, program, b"multiply_color\0") >= 0;
+            if seen.len() >= 64 {
+                seen.clear();
+            }
+            seen.push((program, hud));
+            hud
+        }
+    };
+    LAST.store((program as u64) << 1 | hud as u64, Ordering::Relaxed);
+    hud
+}
+
+/// The game just drew the scope's Lua overlay into this view's HDR buffer, which
+/// the FLIR composite never samples: re-issue the identical draw (all game state
+/// still bound) into the plugin's overlay FBO so the composite can add it.
+unsafe fn capture_hud(mode: u32, count: i32, kind: u32, indices: *const c_void) {
+    if HUD_FAILED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(gl) = gl() else { return };
+    let program = tracked(gl, &TRACK_PROGRAM, GL_CURRENT_PROGRAM);
+    if program <= 0 || !is_hud_program(gl, program as u32) {
+        return;
+    }
+    let viewport = current_viewport(gl);
+    if viewport[0] != 0 || viewport[1] != 0 || viewport[2] <= 0 || viewport[3] <= 0 {
+        log_once_key(0x6a5_0021, || {
+            format!("FLIR: Lua overlay not captured: viewport {viewport:?} does not start at 0,0")
+        });
+        return;
+    }
+    let size = [viewport[2], viewport[3]];
+    let mut slot = HUD_TARGET.lock().unwrap_or_else(|p| p.into_inner());
+    let (texture, fbo, new) = match *slot {
+        Some((texture, fbo, _)) => (texture, fbo, false),
+        None => {
+            let (mut texture, mut fbo) = (0u32, 0u32);
+            (gl.gen_textures)(1, &mut texture);
+            (gl.gen_framebuffers)(1, &mut fbo);
+            (texture, fbo, true)
+        }
+    };
+    if new || slot.map(|s| s.2) != Some(size) {
+        // (Re)specify the storage; the attachment stays valid across resizes.
+        let mut previous = 0i32;
+        glq!(gl.get_integerv, GL_TEXTURE_BINDING_2D, &mut previous);
+        (gl.bind_texture)(GL_TEXTURE_2D, texture);
+        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        {
+            let _unpack = UnpackGuard::begin(gl);
+            (gl.tex_image_2d)(GL_TEXTURE_2D, 0, GL_RGBA16F, size[0], size[1], 0, GL_RGBA, GL_FLOAT, std::ptr::null());
+        }
+        (gl.bind_texture)(GL_TEXTURE_2D, previous as u32);
+        *slot = Some((texture, fbo, size));
+        HUD_FRESH.store(false, Ordering::Relaxed);
+    }
+    drop(slot);
+    // Internal bind straight to the driver (not the game's slot), so the view
+    // trackers never see it; only the draw binding is touched.
+    let mut previous = 0i32;
+    glq!(gl.get_integerv, GL_FRAMEBUFFER_BINDING, &mut previous);
+    (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, fbo);
+    if new {
+        (gl.framebuffer_texture_2d)(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+        let status = (gl.check_framebuffer_status)(GL_DRAW_FRAMEBUFFER);
+        if status != GL_FRAMEBUFFER_COMPLETE {
+            (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, previous as u32);
+            HUD_FAILED.store(true, Ordering::Relaxed);
+            log_once_key(0x6a5_0022, || {
+                format!("FLIR: Lua overlay FBO {fbo} incomplete (status {status:#x}); overlay capture disabled")
+            });
+            return;
+        }
+    }
+    if !HUD_FRESH.swap(true, Ordering::Relaxed) {
+        (gl.push_attrib)(GL_COLOR_BUFFER_BIT | GL_ENABLE_BIT);
+        (gl.disable)(GL_SCISSOR_TEST);
+        (gl.color_mask)(1, 1, 1, 1);
+        (gl.clear_color)(0.0, 0.0, 0.0, 0.0);
+        (gl.clear)(GL_COLOR_BUFFER_BIT);
+        (gl.pop_attrib)();
+    }
+    (gl.draw_elements)(mode, count, kind, indices);
+    (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, previous as u32);
+    #[cfg(feature = "logging")]
+    {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            let blend = (gl.is_enabled)(GL_BLEND);
+            let mut state = [0i32; 5];
+            // BLEND_SRC_RGB, BLEND_DST_RGB, BLEND_SRC_ALPHA, BLEND_DST_ALPHA, BLEND_EQUATION_RGB
+            for (value, pname) in state.iter_mut().zip([0x80c9u32, 0x80c8, 0x80cb, 0x80ca, 0x8009]) {
+                glq!(gl.get_integerv, pname, value);
+            }
+            log_line(&format!(
+                "FLIR: Lua overlay captured {}x{} from program {program} (game FBO {previous}) into \
+FBO {fbo}: blend={blend} src_rgb={:#x} dst_rgb={:#x} src_a={:#x} dst_a={:#x} eq_rgb={:#x}",
+                size[0], size[1], state[0], state[1], state[2], state[3], state[4]
+            ));
+        }
     }
 }
 
@@ -5119,8 +5274,36 @@ learned at the tonemap quad; targets seen so far: {:?}); the game's tonemap is k
     (gl.uniform1f)(composite.enc_max, FLIR_ENC_MAX_C);
     (gl.uniform1f)(composite.sky_c, FLIR_SKY_C);
     (gl.uniform1f)(composite.sky_depth_m, FLIR_SKY_DEPTH_M);
+    // The scope's Lua overlay, captured from this view's additive_hud draws; the
+    // unit's binding is saved explicitly (the attrib stack is only relied on for
+    // units 0-3).
+    let hud_size = HUD_TARGET.lock().unwrap_or_else(|p| p.into_inner()).filter(|_| HUD_FRESH.load(Ordering::Relaxed));
+    let hud = hud_size.filter(|h| h.2 == [viewport[2], viewport[3]]).map(|h| h.0);
+    if let (Some(h), None) = (hud_size, hud) {
+        log_once_key(0x6a5_0023, || {
+            format!(
+                "FLIR: Lua overlay {}x{} not composited: view is {}x{}",
+                h.2[0], h.2[1], viewport[2], viewport[3]
+            )
+        });
+    }
+    let mut hud_previous = 0i32;
+    if let Some(texture) = hud {
+        (gl.active_texture)(GL_TEXTURE0 + HUD_UNIT);
+        glq!(gl.get_integerv, GL_TEXTURE_BINDING_2D, &mut hud_previous);
+        (gl.bind_texture)(GL_TEXTURE_2D, texture);
+        (gl.uniform1i)(composite.tex_hud, HUD_UNIT as i32);
+        log_once_key(0x6a5_0024, || {
+            format!("FLIR: Lua overlay added to the composite {}x{} (target {target})", viewport[2], viewport[3])
+        });
+    }
+    (gl.uniform1i)(composite.has_hud, hud.is_some() as i32);
     // The game's own VAO/element buffer stay bound: same quad, same indices.
     (gl.draw_elements)(mode, count, kind, indices);
+    if hud.is_some() {
+        (gl.active_texture)(GL_TEXTURE0 + HUD_UNIT);
+        (gl.bind_texture)(GL_TEXTURE_2D, hud_previous as u32);
+    }
     log_quad_inputs(gl, main, (pos_loc, coord_loc, mvp_loc), &mat_view_proj, quad);
     #[cfg(feature = "logging")]
     {
@@ -5412,6 +5595,8 @@ fn composite(gl: &'static Gl, pos_loc: u32, coord_loc: u32) -> Option<Composite>
             enc_max: uniform(gl, program, b"enc_max\0"),
             sky_c: uniform(gl, program, b"sky_c\0"),
             sky_depth_m: uniform(gl, program, b"sky_depth_m\0"),
+            tex_hud: uniform(gl, program, b"texture_hud\0"),
+            has_hud: uniform(gl, program, b"has_hud\0"),
             pos_loc,
             coord_loc,
         };
