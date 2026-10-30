@@ -23,8 +23,6 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --target x86_64-pc-windows-gnu --features logging
 ```
 
-(without `--features logging` the debug build writes no diagnostics or crash records)
-
 or for the minimal logging release:
 
 ```
@@ -45,7 +43,7 @@ You should see a line in the log confirming the hooks installed and the `ir` tab
 <Stormworks install>/logs/infrared_bootstrap.log
 ```
 
-The debug build (built with `--features logging`) additionally carries a diagnostic dump: weather, sun, scan direction, source list, source position and more.
+The debug build additionally carries a diagnostic dump: weather, sun, scan direction, source list, source position and more.
 
 ## Lua API
 
@@ -91,11 +89,6 @@ Returns:
 | `n_sources` | how many sources survived culling and occlusion |
 | `id` | this seeker's identity (24 bits, never 0, exact in an f32) — pass it to `ir.frame(id)` |
 
-Two things worth knowing when tuning:
-
-- **A narrower FOV does not increase detection range.** `total_flux` is conserved no matter how the scene maps onto the cells, so FOV only buys angular precision (`fov/cells`) and a tighter acquisition cone.
-- **Detection is a threshold on `total_flux`,** so lowering `detect` extends range roughly as `sqrt(1/threshold)`.
-
 A minimal component would look like:
 
 ```lua
@@ -105,7 +98,7 @@ local cells, az_err, el_err, strength, flux, ambient, n_sources, id = ir.scan(
 
 ## FLIR camera view
 
-A microcontroller LUA node whose **video input** is wired to a camera can turn FLIR on for that camera. The camera's own **Infrared Mode** is left alone and keeps working as the game renders it. Every vehicle block carries a simulated temperature, so a worn engine shows hot while a cold hull stays near ambient. Terrain and water sit at ambient plus sun soak; sky is cold.
+A microcontroller LUA node whose video input is wired to a camera can turn FLIR on for that camera. Every vehicle block carries a simulated temperature, so a worn engine shows hot while a cold hull stays near ambient. **Needs to run in onTick() !!!**
 
 ```lua
 function onTick() -- needs to run in onTick()
@@ -117,14 +110,10 @@ end
 | argument | meaning |
 |---|---|
 | `r`, `g`, `b` | tint multiplied into the image, clamped to `0..1` (default `1, 1, 1`) |
-| `black_hot` | `true` = black hot (the tinted white-hot picture with its colours inverted, like an image editor's invert), `false` = white hot (default white hot) |
+| `black_hot` | `true` = black hot, `false` = white hot (default) |
 | `tmin`, `tmax` | display window in °C, `tmin < tmax` (default `-5`, `60`) |
 
-See `examples/ir_flir.lua` for an example script. The camera video output needs to be connected to the LUA microcontroller block.
-
-## Game updates
-
-The plugin checks each function it hooks before touching it. If a game update moves something, that hook is skipped and reported in the log rather than causing undefined behaviour, and the rest of the plugin keeps working on whatever is still valid.
+See `examples/ir_flir.lua` for an example script.
 
 ## Disclaimer
 

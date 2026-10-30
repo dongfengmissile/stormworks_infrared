@@ -896,10 +896,8 @@ void main()
         v = clamp(v + DETAIL * ((lum - 0.5) * 0.6 + (shade - 0.6)) * smoothstep(0.0, 0.25, v), 0.0, 1.0);
     }
     v = max(v, sun_glow);
-    // Black hot = colour inversion of the tinted white-hot picture (like an
-    // image editor's invert), not a flip of the brightness inside the tint.
-    vec3 rgb = v * tint;
-    color_out = vec4(black_hot == 1 ? vec3(1.0) - rgb : rgb, 1.0);
+    // Black hot flips brightness inside the tint: hot = black, cold = full tint.
+    color_out = vec4((black_hot == 1 ? 1.0 - v : v) * tint, 1.0);
 }
 "#;
 
