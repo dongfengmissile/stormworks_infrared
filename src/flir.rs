@@ -906,12 +906,15 @@ void main()
         v = clamp(v + DETAIL * ((lum - 0.5) * 0.6 + (shade - 0.6)) * smoothstep(0.0, 0.25, v), 0.0, 1.0);
     }
     v = max(v, sun_glow);
+    vec4 overlay = has_hud == 1 ? texture(texture_hud, uv) : vec4(0.0);
+    // Tracers and muzzle flashes (captured into alpha) read as the hottest thing in view.
+    if (overlay.a > 0.0)
+        v = 1.0;
     // Black hot flips brightness inside the tint: hot = black, cold = full tint.
     color_out = vec4((black_hot == 1 ? 1.0 - v : v) * tint, 1.0);
     // The game adds the Lua overlay to the HDR image before its tonemap; keep
     // its own colours on top of the FLIR picture.
-    if (has_hud == 1)
-        color_out.rgb += texture(texture_hud, uv).rgb;
+    color_out.rgb += overlay.rgb;
 }
 "#;
 
@@ -1954,6 +1957,12 @@ fn publish_targets(targets: &Targets, f10: bool) {
 /// camera's FLIR latch is STILL on (checked here, once per bind, not per draw), or
 /// the F10 main view. A feed is judged by its own camera, never by the main view.
 fn update_active_view(framebuffer: u32) {
+    ACTIVE_VIEW.store(forced_kind(framebuffer), Ordering::Relaxed);
+}
+
+/// 1 = `framebuffer` is the IR-forced main view's G-buffer, 2 = a forced camera
+/// feed's, 0 = neither.
+fn forced_kind(framebuffer: u32) -> u32 {
     let mut kind = 0;
     if framebuffer != 0 {
         for (index, slot) in FORCED_GBUFS.iter().enumerate() {
@@ -1967,7 +1976,7 @@ fn update_active_view(framebuffer: u32) {
             break;
         }
     }
-    ACTIVE_VIEW.store(kind, Ordering::Relaxed);
+    kind
 }
 
 /// Refresh the mirrors against the live registry (F10 can change at any time).
@@ -2316,7 +2325,7 @@ pub(crate) extern "system" fn gl_draw_elements_entry_rust(
                 std::panic::catch_unwind(|| unsafe { tonemap_quad(pending == 2, camera, (mode, count, kind, indices)) })
                     .unwrap_or(false);
             // The captured overlay belonged to this view only.
-            HUD_FRESH.store(false, Ordering::Relaxed);
+            HUD_FRESH.store(0, Ordering::Relaxed);
             if replaced {
                 return;
             }
@@ -2354,53 +2363,106 @@ pub(crate) extern "system" fn gl_draw_elements_entry_rust(
     }
 }
 
-/// Plugin-owned copy of the scope's Lua overlay: (texture, FBO, size).
-static HUD_TARGET: Mutex<Option<(u32, u32, [i32; 2])>> = Mutex::new(None);
-/// The overlay texture holds this view's overlay (set by the first capture
-/// after a tonemap quad, cleared at every tonemap quad).
-static HUD_FRESH: AtomicBool = AtomicBool::new(false);
+/// Plugin-owned overlay captures (texture, FBO, size), one per render size so a
+/// FLIR main view and FLIR camera feeds in the same frame do not reallocate.
+static HUD_TARGETS: Mutex<Vec<(u32, u32, [i32; 2])>> = Mutex::new(Vec::new());
+const MAX_HUD_TARGETS: usize = 4;
+/// Size (`w << 32 | h`) of the capture holding this view's overlay; 0 = none.
+/// Set by the first capture after a tonemap quad, cleared at every tonemap quad.
+static HUD_FRESH: AtomicU64 = AtomicU64::new(0);
+
+fn pack_size(size: [i32; 2]) -> u64 {
+    (size[0] as u32 as u64) << 32 | size[1] as u32 as u64
+}
 static HUD_FAILED: AtomicBool = AtomicBool::new(false);
 /// Composite texture unit for the overlay (explicitly saved/restored).
 const HUD_UNIT: u32 = 4;
 
-/// `graphics/shaders/additive_hud` (the scope's Lua surface): the program with
-/// both `texture_overlay` and `multiply_color`. Cached per program id.
-unsafe fn is_hud_program(gl: &'static Gl, program: u32) -> bool {
-    static LAST: AtomicU64 = AtomicU64::new(0); // program << 1 | hud
+/// Overlay program kind: 1 = `graphics/shaders/additive_hud` (the scope's Lua
+/// surface: `texture_overlay` + `multiply_color`), 2 = `graphics/shaders/additive`
+/// (tracers, among other glows: `additive_factor`), 0 = anything else. Cached per
+/// program id.
+unsafe fn overlay_kind(gl: &'static Gl, program: u32) -> u8 {
+    static LAST: AtomicU64 = AtomicU64::new(0); // program << 2 | kind
     let last = LAST.load(Ordering::Relaxed);
-    if last >> 1 == program as u64 {
-        return last & 1 == 1;
+    if last >> 2 == program as u64 {
+        return (last & 3) as u8;
     }
-    static SEEN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    static SEEN: Mutex<Vec<(u32, u8)>> = Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
-    let hud = match seen.iter().find(|e| e.0 == program) {
-        Some(&(_, hud)) => hud,
+    let kind = match seen.iter().find(|e| e.0 == program) {
+        Some(&(_, kind)) => kind,
         None => {
-            let hud = uniform(gl, program, b"texture_overlay\0") >= 0
-                && uniform(gl, program, b"multiply_color\0") >= 0;
+            // `additive_monitor` (in-world monitor screens) has the same two
+            // uniforms plus texture_video; a thermal camera does not see screens.
+            let kind = if uniform(gl, program, b"texture_overlay\0") >= 0
+                && uniform(gl, program, b"multiply_color\0") >= 0
+                && uniform(gl, program, b"texture_video\0") < 0
+            {
+                1
+            } else if uniform(gl, program, b"additive_factor\0") >= 0 {
+                2
+            } else {
+                0
+            };
             if seen.len() >= 64 {
                 seen.clear();
             }
-            seen.push((program, hud));
-            hud
+            seen.push((program, kind));
+            kind
         }
     };
-    LAST.store((program as u64) << 1 | hud as u64, Ordering::Relaxed);
-    hud
+    LAST.store((program as u64) << 2 | kind as u64, Ordering::Relaxed);
+    kind
 }
 
-/// The game just drew the scope's Lua overlay into this view's HDR buffer, which
-/// the FLIR composite never samples: re-issue the identical draw (all game state
-/// still bound) into the plugin's overlay FBO so the composite can add it.
+/// Index counts of `meshes/fx_projectile_tracer.mesh` (60) and
+/// `meshes/fx_muzzle_flash.mesh` (768, drawn whole by the same `additive`
+/// list): the only way to tell them from the other `additive` draws at GL time.
+const HOT_FX_INDEX_COUNTS: [i32; 2] = [60, 768];
+const MUZZLE_FLASH_INDEX_COUNT: i32 = 768;
+/// The muzzle flash is redrawn this much larger for FLIR: the hot propellant
+/// gas (and its secondary burn in air) radiates well beyond the visible flash.
+const MUZZLE_FLASH_IR_SCALE: f32 = 1.5;
+
+/// The game just drew the scope's Lua overlay or a tracer into this view's HDR
+/// buffer, which the FLIR composite never samples: re-issue the identical draw
+/// (all game state still bound) into the plugin's overlay FBO so the composite
+/// can use it. The Lua overlay goes to rgb (added as-is); tracers go to alpha
+/// only, depth-tested against the view's G-buffer depth, and read as hottest.
 unsafe fn capture_hud(mode: u32, count: i32, kind: u32, indices: *const c_void) {
     if HUD_FAILED.load(Ordering::Relaxed) {
         return;
     }
-    let Some(gl) = gl() else { return };
-    let program = tracked(gl, &TRACK_PROGRAM, GL_CURRENT_PROGRAM);
-    if program <= 0 || !is_hud_program(gl, program as u32) {
+    // Only views that will be composited (their G-buffer is IR-forced).
+    if forced_kind(LAST_GBUF.load(Ordering::Relaxed)) == 0 {
         return;
     }
+    let Some(gl) = gl() else { return };
+    let program = tracked(gl, &TRACK_PROGRAM, GL_CURRENT_PROGRAM);
+    if program <= 0 {
+        return;
+    }
+    let tracer = match overlay_kind(gl, program as u32) {
+        1 => false,
+        2 if HOT_FX_INDEX_COUNTS.contains(&count) => true,
+        _ => return,
+    };
+    // Tracers must be hidden behind terrain/blocks like in the game, which tests
+    // them against a copy of the G-buffer depth.
+    let depth = if tracer {
+        match gbuffer_for(gl, LAST_GBUF.load(Ordering::Relaxed)) {
+            Some(g) if g.depth != 0 => g.depth,
+            _ => {
+                log_once_key(0x6a5_0025, || {
+                    "FLIR: tracer not captured: the view's G-buffer has no depth texture".to_string()
+                });
+                return;
+            }
+        }
+    } else {
+        0
+    };
     let viewport = current_viewport(gl);
     if viewport[0] != 0 || viewport[1] != 0 || viewport[2] <= 0 || viewport[3] <= 0 {
         log_once_key(0x6a5_0021, || {
@@ -2409,17 +2471,23 @@ unsafe fn capture_hud(mode: u32, count: i32, kind: u32, indices: *const c_void) 
         return;
     }
     let size = [viewport[2], viewport[3]];
-    let mut slot = HUD_TARGET.lock().unwrap_or_else(|p| p.into_inner());
-    let (texture, fbo, new) = match *slot {
-        Some((texture, fbo, _)) => (texture, fbo, false),
-        None => {
+    let mut targets = HUD_TARGETS.lock().unwrap_or_else(|p| p.into_inner());
+    let found = targets.iter().position(|t| t.2 == size);
+    let (index, new) = match found {
+        Some(i) => (i, false),
+        None if targets.len() < MAX_HUD_TARGETS => {
             let (mut texture, mut fbo) = (0u32, 0u32);
             (gl.gen_textures)(1, &mut texture);
             (gl.gen_framebuffers)(1, &mut fbo);
-            (texture, fbo, true)
+            targets.push((texture, fbo, [0, 0]));
+            (targets.len() - 1, true)
         }
+        // shortcut: more than 4 render sizes reuse the last capture (realloc per
+        // switch); upgrade to LRU eviction if many differently sized FLIR feeds appear.
+        None => (targets.len() - 1, false),
     };
-    if new || slot.map(|s| s.2) != Some(size) {
+    let (texture, fbo, _) = targets[index];
+    if found.is_none() {
         // (Re)specify the storage; the attachment stays valid across resizes.
         let mut previous = 0i32;
         glq!(gl.get_integerv, GL_TEXTURE_BINDING_2D, &mut previous);
@@ -2433,10 +2501,12 @@ unsafe fn capture_hud(mode: u32, count: i32, kind: u32, indices: *const c_void) 
             (gl.tex_image_2d)(GL_TEXTURE_2D, 0, GL_RGBA16F, size[0], size[1], 0, GL_RGBA, GL_FLOAT, std::ptr::null());
         }
         (gl.bind_texture)(GL_TEXTURE_2D, previous as u32);
-        *slot = Some((texture, fbo, size));
-        HUD_FRESH.store(false, Ordering::Relaxed);
+        targets[index].2 = size;
+        if HUD_FRESH.load(Ordering::Relaxed) == pack_size(size) {
+            HUD_FRESH.store(0, Ordering::Relaxed);
+        }
     }
-    drop(slot);
+    drop(targets);
     // Internal bind straight to the driver (not the game's slot), so the view
     // trackers never see it; only the draw binding is touched.
     let mut previous = 0i32;
@@ -2454,7 +2524,7 @@ unsafe fn capture_hud(mode: u32, count: i32, kind: u32, indices: *const c_void) 
             return;
         }
     }
-    if !HUD_FRESH.swap(true, Ordering::Relaxed) {
+    if HUD_FRESH.swap(pack_size(size), Ordering::Relaxed) != pack_size(size) {
         (gl.push_attrib)(GL_COLOR_BUFFER_BIT | GL_ENABLE_BIT);
         (gl.disable)(GL_SCISSOR_TEST);
         (gl.color_mask)(1, 1, 1, 1);
@@ -2462,12 +2532,48 @@ unsafe fn capture_hud(mode: u32, count: i32, kind: u32, indices: *const c_void) 
         (gl.clear)(GL_COLOR_BUFFER_BIT);
         (gl.pop_attrib)();
     }
+    // Depth is attached only while a tracer draws (read-only: the game's
+    // additive stage has depth writes off), so the Lua overlay is never
+    // clipped by scene depth that its own target would not have.
+    (gl.framebuffer_texture_2d)(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth, 0);
+    (gl.push_attrib)(GL_COLOR_BUFFER_BIT);
+    if tracer {
+        (gl.color_mask)(0, 0, 0, 1);
+    } else {
+        (gl.color_mask)(1, 1, 1, 0);
+    }
+    // Muzzle flash: scale the game's mat_world about the flash origin (the
+    // muzzle) for our copy only, then put the game's value back.
+    let mut flash_world = None;
+    if tracer && count == MUZZLE_FLASH_INDEX_COUNT {
+        let loc = uniform(gl, program as u32, b"mat_world\0");
+        if loc >= 0 {
+            let mut m = [0f32; 16];
+            glq!(gl.get_uniformfv, program as u32, loc, m.as_mut_ptr());
+            let mut scaled = m;
+            scaled[..12].iter_mut().for_each(|v| *v *= MUZZLE_FLASH_IR_SCALE);
+            (gl.uniform_matrix4fv)(loc, 1, 0, scaled.as_ptr());
+            flash_world = Some((loc, m));
+        }
+    }
     (gl.draw_elements)(mode, count, kind, indices);
+    if let Some((loc, m)) = flash_world {
+        (gl.uniform_matrix4fv)(loc, 1, 0, m.as_ptr());
+    }
+    (gl.pop_attrib)();
+    if depth != 0 {
+        (gl.framebuffer_texture_2d)(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+    }
     (gl.bind_framebuffer)(GL_DRAW_FRAMEBUFFER, previous as u32);
+    if tracer {
+        log_once_key(0x6a5_0026 ^ ((count as u64) << 20), || {
+            format!("FLIR: hot fx (tracer/muzzle flash) captured (program {program}, {count} indices, depth texture {depth})")
+        });
+    }
     #[cfg(feature = "logging")]
     {
         static LOGGED: AtomicBool = AtomicBool::new(false);
-        if !LOGGED.swap(true, Ordering::Relaxed) {
+        if !tracer && !LOGGED.swap(true, Ordering::Relaxed) {
             let blend = (gl.is_enabled)(GL_BLEND);
             let mut state = [0i32; 5];
             // BLEND_SRC_RGB, BLEND_DST_RGB, BLEND_SRC_ALPHA, BLEND_DST_ALPHA, BLEND_EQUATION_RGB
@@ -5277,13 +5383,19 @@ learned at the tonemap quad; targets seen so far: {:?}); the game's tonemap is k
     // The scope's Lua overlay, captured from this view's additive_hud draws; the
     // unit's binding is saved explicitly (the attrib stack is only relied on for
     // units 0-3).
-    let hud_size = HUD_TARGET.lock().unwrap_or_else(|p| p.into_inner()).filter(|_| HUD_FRESH.load(Ordering::Relaxed));
-    let hud = hud_size.filter(|h| h.2 == [viewport[2], viewport[3]]).map(|h| h.0);
+    let fresh = HUD_FRESH.load(Ordering::Relaxed);
+    let hud_size = (fresh != 0)
+        .then(|| HUD_TARGETS.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|t| pack_size(t.2) == fresh).copied())
+        .flatten();
+    // The overlay was captured at the view's render size, which is the G-buffer's
+    // (a camera feed renders 1152x640 into a 128x128 target); both are sampled
+    // with normalised UVs.
+    let hud = hud_size.filter(|h| h.2 == gbuffer.size).map(|h| h.0);
     if let (Some(h), None) = (hud_size, hud) {
         log_once_key(0x6a5_0023, || {
             format!(
-                "FLIR: Lua overlay {}x{} not composited: view is {}x{}",
-                h.2[0], h.2[1], viewport[2], viewport[3]
+                "FLIR: overlay {}x{} not composited: view renders at {}x{}",
+                h.2[0], h.2[1], gbuffer.size[0], gbuffer.size[1]
             )
         });
     }

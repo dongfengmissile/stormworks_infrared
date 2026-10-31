@@ -78,6 +78,53 @@ const OFF_COMP_DEF: usize = 0x58;
 /// Definition: per-component mass, voxel-cell set (60-byte entries, int3 at 0).
 const OFF_DEF_MASS: usize = 0x2B0;
 const OFF_DEF_CELLS: usize = 0xA8;
+
+// Guns: one class `c_scene_vehicle_component_weapon` for every gun (RE: tick
+// 0x429B60 adds a per-class amount per shot, decays 0.002/tick; the red glow
+// draw 0x42FF20 reads the same field).
+const WEAPON_VTABLE_RVA: usize = 0x00af_d290;
+/// f32 0..1 overheat fraction (1.0 = overheated, smoking, cannot fire).
+const OFF_WEAPON_HEAT: usize = 0x384;
+/// Barrel extension / muzzle piece -> the gun it is chained to.
+const OFF_WEAPON_GUN: usize = 0x3B0;
+/// Definition `weapon_type`: 2 gun body, 4 barrel extension, 7 muzzle.
+const OFF_DEF_WEAPON_TYPE: usize = 0x2938;
+// `weapon_class` follows at +0x293C (0 MG .. 6 Bertha).
+/// Barrel temperature above air at full overheat (steel glows dull red ~500 C).
+const GUN_HOT_C: f32 = 500.0;
+/// Share of that heat in a gun body's breech/receiver cells (local Y <= 0): the
+/// propellant gas heats the barrel; the breech block stays much cooler.
+const BREECH_HEAT_SHARE: f32 = 0.2;
+/// Share at the muzzle: a barrel is hottest just ahead of the chamber, where the
+/// gas is hottest and pushes longest, and cools linearly toward the muzzle.
+const MUZZLE_HEAT_SHARE: f32 = 0.4;
+/// Gun +0x378: barrel length in metres including extensions/muzzle (written by
+/// the chain builder 0x4B5700 as 0.25*voxels + 0.175).
+const OFF_WEAPON_BARREL_M: usize = 0x378;
+/// Gun +0x3C: rotation row 1 = the barrel direction in body voxels.
+const OFF_COMP_ROT_Y: usize = OFF_COMP_ROT + 12;
+
+/// Heat share of a barrel cell `y` voxels ahead of the breech of a barrel
+/// `len` voxels long (1 at the first barrel voxel, `MUZZLE_HEAT_SHARE` at the end).
+fn barrel_share(y: f32, len: f32) -> f32 {
+    let t = ((y - 1.0) / (len - 1.0).max(1.0)).clamp(0.0, 1.0);
+    1.0 + (MUZZLE_HEAT_SHARE - 1.0) * t
+}
+
+/// Gun origin voxel, barrel direction and total barrel length (voxels).
+unsafe fn barrel_axis(gun: usize) -> Option<([i32; 3], [i32; 3], f32)> {
+    if gun < PTR_MIN || !readable(gun, OFF_WEAPON_GUN + 8) {
+        return None;
+    }
+    let i3 = |a: usize| [read_u32_at(a) as i32, read_u32_at(a + 4) as i32, read_u32_at(a + 8) as i32];
+    let dir = i3(gun + OFF_COMP_ROT_Y);
+    if dir.iter().map(|v| v.abs()).sum::<i32>() != 1 {
+        return None;
+    }
+    let m = read_f32_at(gun + OFF_WEAPON_BARREL_M);
+    let len = if m.is_finite() && (0.2..30.0).contains(&m) { (m - 0.175) / CELL_M } else { 8.0 };
+    Some((i3(gun + OFF_COMP_VOXEL), dir, len.max(1.0)))
+}
 const CELL_ENTRY_BYTES: usize = 60;
 /// Body -> `compartment_fires`: ptr to 104-byte records / record count.
 const OFF_BODY_FIRES: usize = 0x1218;
@@ -119,7 +166,8 @@ const SPECIFIC_HEAT_J_KG_K: f32 = 500.0;
 // 200 W/m2K * 0.0625 m2 = 12.5 W/K, the same as one conduction link: a part
 // touching a hot neighbour body (landing gear on a wing) heats like a block.
 const H_ENV_W_M2_K: f32 = 200.0;
-/// Coupling to ambient air, W/(m^2 K).
+/// Coupling to ambient air, W/(m^2 K) per exposed face (a buried cell loses
+/// nothing to air directly).
 const H_AIR_W_M2_K: f32 = 4.0;
 /// Voxel-to-voxel conduction, W/K per face.
 // Steel-like: k≈50 W/(m·K) × 0.0625 m² / 0.25 m ≈ 12.5 W/K per shared face.
@@ -164,6 +212,10 @@ const SOURCE_MAX_DIST_M: f64 = 4.0;
 const HOT_LOG_INTERVAL_MS: u64 = 5000;
 /// Mass assumed for a cell whose definition has no usable mass.
 const FALLBACK_MASS_KG_PER_CELL: f32 = 1.0;
+/// Heat capacity never uses less than a normal 1 kg block: game masses are
+/// gameplay values (~1/100 of solid steel), and lightweight blocks (0.2 kg)
+/// would otherwise pass heat on 5x faster than normal ones.
+const MIN_HEAT_MASS_KG_PER_CELL: f32 = 1.0;
 /// Lower bound on heat capacity so a near-massless cell cannot divide by ~0.
 const MIN_CAPACITY_J_K: f32 = 1.0;
 /// Temperatures are clamped here; the game's own sources cap around 400 C.
@@ -640,6 +692,118 @@ fn matrix_ok(m: &[f64; 16]) -> bool {
 
 /// Voxel cell -> world metres: `voxel_m * M`, row-vector convention.
 #[inline]
+/// The game's own overheat fraction (0..1) of a gun body, barrel extension or
+/// muzzle, plus the gun body it belongs to (0 if unresolved), None for anything else. Every cell of a gun follows it (0 = air
+/// temperature), so the barrel cools exactly as the game's red glow fades
+/// instead of keeping a heavy gun's stored heat for half an hour.
+unsafe fn gun_heat(component: usize) -> Option<(f32, usize)> {
+    let weapon_vt = state::MODULE_BASE.load(Ordering::SeqCst) + WEAPON_VTABLE_RVA;
+    let is_weapon = |c: usize| {
+        c >= PTR_MIN && c % 8 == 0 && readable(c, OFF_WEAPON_GUN + 8) && read_usize_at(c) == weapon_vt
+    };
+    let weapon_type = |c: usize| {
+        let def = read_usize_at(c + OFF_COMP_DEF);
+        (def >= PTR_MIN && readable(def + OFF_DEF_WEAPON_TYPE, 4)).then(|| read_u32_at(def + OFF_DEF_WEAPON_TYPE))
+    };
+    let heat = |c: usize| {
+        let h = read_f32_at(c + OFF_WEAPON_HEAT);
+        if h.is_finite() { h.clamp(0.0, 1.0) } else { 0.0 }
+    };
+    if weapon_vt == WEAPON_VTABLE_RVA || !is_weapon(component) {
+        return None;
+    }
+    match weapon_type(component)? {
+        2 => Some((gun_excess(component, heat(component)), component)),
+        // Barrel extensions/muzzles (every gun but the machine gun takes them):
+        // walk the back-pointers to the gun, keeping the hottest value seen in
+        // case the game also writes the piece's own field.
+        4 | 7 => {
+            let mut h = heat(component);
+            let mut c = component;
+            let mut gun = 0;
+            for _ in 0..16 {
+                c = read_usize_at(c + OFF_WEAPON_GUN);
+                if !is_weapon(c) {
+                    break;
+                }
+                h = h.max(heat(c));
+                if weapon_type(c) == Some(2) {
+                    gun = c;
+                    break;
+                }
+            }
+            #[cfg(feature = "logging")]
+            {
+                // One line for a resolved hot piece, one for an unresolved one.
+                static LOGGED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+                let bit = if gun == 0 { 2 } else { 1 };
+                if (h > 0.01 || gun == 0) && LOGGED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                    crate::logging::log_line(&format!(
+                        "blocktemp: barrel piece component={component:#x} own_heat={:.3} gun={gun:#x} heat={h:.3}",
+                        heat(component)
+                    ));
+                }
+            }
+            let excess = if gun != 0 { gun_excess(gun, heat(gun)) } else { 0.0 };
+            Some((excess.max(GUN_HOT_C * h), gun))
+        }
+        _ => None,
+    }
+}
+
+/// Per shot: the game's own heat increment (tick 0x429B60 table at 0xCC3800,
+/// +44) and the barrel's temperature rise / cooling time constant, by
+/// `weapon_class` (MG, light AC, rotary AC, heavy AC, battle cannon,
+/// artillery, Bertha). Cannons barely move the game's value (0.02 per shot
+/// against 0.12/s decay), so their heat comes from counting shots.
+const GUN_CLASSES: [(f32, f32, f32); 7] = [
+    (0.0125, 0.3, 60.0),
+    (0.025, 1.0, 90.0),
+    (0.01, 0.5, 90.0),
+    (0.08, 3.0, 120.0),
+    (0.02, 12.0, 180.0),
+    (0.02, 15.0, 240.0),
+    (0.02, 25.0, 300.0),
+];
+/// The game's heat decay per tick.
+const GUN_DECAY_PER_TICK: f32 = 0.002;
+
+/// gun -> (last game heat, tick it was read, modelled barrel excess C).
+static GUN_MODEL: Mutex<Option<HashMap<usize, (f32, u64, f32)>>> = Mutex::new(None);
+
+/// Barrel temperature above air at the chamber end: the larger of the game's
+/// overheat value (autocannons/MGs) and a per-shot model that keeps a slowly
+/// cooling barrel (cannons). Shots are counted from rises of the game's value.
+unsafe fn gun_excess(gun: usize, h: f32) -> f32 {
+    let def = read_usize_at(gun + OFF_COMP_DEF);
+    let class = read_u32_at(def + OFF_DEF_WEAPON_TYPE + 4) as usize;
+    let Some(&(per_shot, rise_c, tau_s)) = GUN_CLASSES.get(class) else {
+        return GUN_HOT_C * h;
+    };
+    let tick = SCENE_TICKS.load(Ordering::Relaxed);
+    let mut guard = lock(&GUN_MODEL);
+    let map = guard.get_or_insert_with(HashMap::default);
+    if map.len() > 1024 {
+        map.retain(|_, e| tick.saturating_sub(e.1) < 60 * 60);
+    }
+    let entry = map.entry(gun).or_insert((h, tick, 0.0));
+    let ticks = tick.saturating_sub(entry.1);
+    if ticks > 0 {
+        *entry = (h, tick, barrel_model_step(entry.0, h, ticks, entry.2, (per_shot, rise_c, tau_s)));
+    }
+    entry.2.max(GUN_HOT_C * h)
+}
+
+/// One model step over `ticks` game ticks: count shots from the rise of the
+/// game's heat value above its expected decay, cool, then add their heat.
+fn barrel_model_step(h_prev: f32, h: f32, ticks: u64, excess: f32, (per_shot, rise_c, tau_s): (f32, f32, f32)) -> f32 {
+    let expected = (h_prev - GUN_DECAY_PER_TICK * ticks as f32).max(0.0);
+    let rise = h - expected;
+    let shots = if rise > 0.5 * per_shot { (rise / per_shot).round().max(1.0) } else { 0.0 };
+    let cooled = excess * (-(ticks as f32 / 60.0) / tau_s).exp();
+    (cooled + shots * rise_c).min(GUN_HOT_C)
+}
+
 fn voxel_to_world(m: &[f64; 16], x: i32, y: i32, z: i32) -> Vec3 {
     let vx = x as f64 * CELL_M as f64;
     let vy = y as f64 * CELL_M as f64;
@@ -1155,9 +1319,11 @@ origin={origin:?} rotation={rotation:?} (read_ok={rotation_ok}) cells={cells:?}"
                         continue;
                     }
                     let rotated = [
-                        rotation[0] * offset[0] + rotation[1] * offset[1] + rotation[2] * offset[2],
-                        rotation[3] * offset[0] + rotation[4] * offset[1] + rotation[5] * offset[2],
-                        rotation[6] * offset[0] + rotation[7] * offset[1] + rotation[8] * offset[2],
+                        // Rows are the images of the local axes (game cell loop 0x4B0BA0:
+                        // body = origin + o.x*(m0,m1,m2) + o.y*(m3,m4,m5) + o.z*(m6,m7,m8)).
+                        rotation[0] * offset[0] + rotation[3] * offset[1] + rotation[6] * offset[2],
+                        rotation[1] * offset[0] + rotation[4] * offset[1] + rotation[7] * offset[2],
+                        rotation[2] * offset[0] + rotation[5] * offset[1] + rotation[8] * offset[2],
                     ];
                     let x = origin[0].saturating_add(rotated[0]);
                     let y = origin[1].saturating_add(rotated[1]);
@@ -1349,6 +1515,9 @@ type HeatOwner = (usize, [i32; 3]);
 /// Owner voxel x of a conducted heat point: it heats every body but its own.
 const BODY_WIDE_OWNER: i32 = i32::MIN;
 const CONDUCTED_POINT_EXCESS_C: f32 = 15.0;
+/// A conducted point only reaches cells of another body this close (touching,
+/// allowing for the 2x2x2 grouping of points), m.
+const CONTACT_M: f64 = 0.6;
 const MAX_CONDUCTED_POINTS: usize = 2048;
 
 /// World-space heat points (burning voxels and hot source cells) in a spatial hash.
@@ -1407,10 +1576,12 @@ impl FireField {
     }
 
     /// Hottest contribution within `FIRE_FADE_M`, never below `t_air`; the
-    /// point owned by `own` is ignored.
-    fn env_temp(&self, p: Vec3, t_air: f32, own: Option<HeatOwner>) -> f32 {
+    /// point owned by `own` is ignored. The flag is set when the hottest one is
+    /// another body's conducted (contact) point.
+    fn env_temp(&self, p: Vec3, t_air: f32, own: Option<HeatOwner>) -> (f32, bool) {
         let [bx, by, bz] = Self::bucket(p);
         let mut best = t_air;
+        let mut contact = false;
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
@@ -1428,14 +1599,26 @@ impl FireField {
                         }
                         let d = ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) + (p.2 - q.2).powi(2))
                             .sqrt();
-                        if d < FIRE_FADE_M {
-                            best = best.max(heat_temp_at(d, t, t_air));
+                        let is_contact = owner.is_some_and(|o| o.1[0] == BODY_WIDE_OWNER);
+                        let v = if is_contact {
+                            if d > CONTACT_M {
+                                continue;
+                            }
+                            t
+                        } else if d < FIRE_FADE_M {
+                            heat_temp_at(d, t, t_air)
+                        } else {
+                            continue;
+                        };
+                        if v > best {
+                            best = v;
+                            contact = is_contact;
                         }
                     }
                 }
             }
         }
-        best
+        (best, contact)
     }
 }
 
@@ -1931,6 +2114,9 @@ cells={} min={min:?} dims={dims:?} first_cell=({},{},{}) d0={:.0} d1={:.0} d2={:
 
         let mut new_bound: HashMap<usize, (f32, u32, [i32; 3], Vec3, Vec3)> = HashMap::default();
         let mut conducted: HashMap<[i32; 3], (Vec3, f32)> = HashMap::default();
+        let mut guns: HashMap<usize, Option<(f32, usize)>> = HashMap::default();
+        let mut barrels: HashMap<usize, Option<([i32; 3], [i32; 3], f32)>> = HashMap::default();
+        let mut slot_at: HashMap<usize, usize> = HashMap::default();
         for raw in &self.pending {
             let mut source_c = None;
             if let Some(&(t, pos)) = self.sources.get(&raw.component) {
@@ -1960,6 +2146,30 @@ its voxel ({},{},{}) world=({:.1},{:.1},{:.1}) source_pos=({:.1},{:.1},{:.1})",
                     });
                 }
             }
+            if source_c.is_none() {
+                let heat = *guns
+                    .entry(raw.component)
+                    .or_insert_with(|| unsafe { gun_heat(raw.component) });
+                // Conduction only: a barrel does not radiate into the blocks
+                // around it the way an engine heats its hood. Pinned even when
+                // cold (h = 0 -> air).
+                if let Some((excess, gun)) = heat {
+                    let along = barrels
+                        .entry(gun)
+                        .or_insert_with(|| unsafe { barrel_axis(gun) })
+                        .map(|(o, d, len)| {
+                            let v = [raw.x - o[0], raw.y - o[1], raw.z - o[2]];
+                            ((v[0] * d[0] + v[1] * d[1] + v[2] * d[2]) as f32, len)
+                        });
+                    let share = match along {
+                        // The gun's own breech/receiver cells.
+                        Some((y, _)) if gun == raw.component && y < 1.0 => BREECH_HEAT_SHARE,
+                        Some((y, len)) => barrel_share(y, len),
+                        None => MUZZLE_HEAT_SHARE,
+                    };
+                    source_c = Some(t_air + excess * share);
+                }
+            }
             let x = raw.x - min[0];
             let y = raw.y - min[1];
             let z = raw.z - min[2];
@@ -1974,7 +2184,8 @@ its voxel ({},{},{}) world=({:.1},{:.1},{:.1}) source_pos=({:.1},{:.1},{:.1})",
                 y: raw.y,
                 z: raw.z,
             };
-            let capacity = (raw.mass_kg * SPECIFIC_HEAT_J_KG_K).max(MIN_CAPACITY_J_K);
+            let capacity =
+                (raw.mass_kg.max(MIN_HEAT_MASS_KG_PER_CELL) * SPECIFIC_HEAT_J_KG_K).max(MIN_CAPACITY_J_K);
             let temperature = match self.cells.entry(key) {
                 Entry::Occupied(mut entry) => {
                     let state = entry.get_mut();
@@ -1994,6 +2205,20 @@ its voxel ({},{},{}) world=({:.1},{:.1},{:.1}) source_pos=({:.1},{:.1},{:.1})",
                 }
             };
             grid.temps_c[index] = temperature;
+            // Two parts listing the same voxel (a gun's barrel overlapping a
+            // neighbour's footprint) share one cell: step it once, keeping the
+            // hotter source. Two slots would each step it and the last
+            // (unpinned) one would overwrite the pinned barrel.
+            if let Some(&i) = slot_at.get(&index) {
+                let slot = &mut self.slots[i];
+                if source_c.unwrap_or(f32::MIN) > slot.source_c.unwrap_or(f32::MIN) {
+                    slot.source_c = source_c;
+                    slot.component = raw.component;
+                }
+                slot.capacity_j_k = slot.capacity_j_k.max(capacity);
+                continue;
+            }
+            slot_at.insert(index, self.slots.len());
             self.slots.push(CellSlot {
                 index,
                 x: raw.x,
@@ -2082,8 +2307,8 @@ voxel={voxel:?} world=({:.1},{:.1},{:.1}) source_pos=({:.1},{:.1},{:.1})",
                     }
                 }
 
-                let t_env = if !near_heat {
-                    t_air
+                let (t_env, contact) = if !near_heat {
+                    (t_air, false)
                 } else {
                     let world = voxel_to_world(&matrix, slot.x, slot.y, slot.z);
                     self.fire.env_temp(world, t_air, Some((body_ptr, [slot.x, slot.y, slot.z])))
@@ -2099,12 +2324,16 @@ voxel={voxel:?} world=({:.1},{:.1},{:.1}) source_pos=({:.1},{:.1},{:.1})",
                     // Only exposed faces see the fire/heat field, and only when a heat point is
                     // near (t_env > t_air); otherwise plain air convection (h_air) applies, so a
                     // climbing jet does not dump its heat to cold air at fire-coupling rates.
-                    h_env_w_k: if t_env > t_air {
-                        h_env_w_k * 6u32.saturating_sub(neighbour_count) as f32
-                    } else {
+                    // Another body's warm cell touches through one face: a single
+                    // conduction link. The fire/engine field couples every exposed face.
+                    h_env_w_k: if t_env <= t_air || neighbour_count >= 6 {
                         0.0
+                    } else if contact {
+                        K_COND_W_PER_K
+                    } else {
+                        h_env_w_k * (6 - neighbour_count) as f32
                     },
-                    h_air_w_k,
+                    h_air_w_k: h_air_w_k * 6u32.saturating_sub(neighbour_count) as f32,
                     k_cond_w_k: K_COND_W_PER_K,
                     neighbour_count,
                     neighbour_sum_c: neighbour_sum,
@@ -2505,23 +2734,23 @@ mod tests {
         assert_eq!(fire_temp_at(2.0, 500.0), 500.0);
 
         let mut field = FireField::default();
-        assert_eq!(field.env_temp((0.0, 0.0, 0.0), 20.0, None), 20.0);
+        assert_eq!(field.env_temp((0.0, 0.0, 0.0), 20.0, None).0, 20.0);
         // Points straddling a bucket border and in a negative bucket.
         field.insert((0.99, 0.0, -0.01), FIRE_TEMP_C, None);
         field.insert((-10.2, 3.0, 7.7), FIRE_TEMP_C, None);
         assert_eq!(field.len, 2);
         // Neighbour bucket (x = 1.2) is within 0.4 m of the first point.
-        assert_eq!(field.env_temp((1.2, 0.0, 0.0), 20.0, None), FIRE_TEMP_C);
-        assert_eq!(field.env_temp((-10.2, 3.2, 7.7), 20.0, None), FIRE_TEMP_C);
-        let t = field.env_temp((0.99 + 0.7, 0.0, -0.01), 20.0, None);
+        assert_eq!(field.env_temp((1.2, 0.0, 0.0), 20.0, None).0, FIRE_TEMP_C);
+        assert_eq!(field.env_temp((-10.2, 3.2, 7.7), 20.0, None).0, FIRE_TEMP_C);
+        let t = field.env_temp((0.99 + 0.7, 0.0, -0.01), 20.0, None).0;
         assert!((t - 210.0).abs() < 0.5, "t={t}");
         // Far from every voxel: air.
-        assert_eq!(field.env_temp((3.0, 0.0, 0.0), 20.0, None), 20.0);
-        assert_eq!(field.env_temp((0.0, 50.0, 0.0), 20.0, None), 20.0);
+        assert_eq!(field.env_temp((3.0, 0.0, 0.0), 20.0, None).0, 20.0);
+        assert_eq!(field.env_temp((0.0, 50.0, 0.0), 20.0, None).0, 20.0);
         // A 100 C point: lerps 100 -> air between 0.4 m and 1.0 m.
         let mut hot = FireField::default();
         hot.insert((0.0, 0.0, 0.0), 100.0, None);
-        let t = hot.env_temp((0.7, 0.0, 0.0), 20.0, None);
+        let t = hot.env_temp((0.7, 0.0, 0.0), 20.0, None).0;
         assert!((t - 60.0).abs() < 0.5, "t={t}");
     }
 
@@ -2542,9 +2771,9 @@ mod tests {
         let mut field = FireField::default();
         field.insert((0.0, 0.0, 0.0), 300.0, Some((1, [0, 0, 0])));
         // Own point ignored; another body's cell at the same spot sees it.
-        assert_eq!(field.env_temp((0.0, 0.0, 0.0), 20.0, Some((1, [0, 0, 0]))), 20.0);
-        assert_eq!(field.env_temp((0.0, 0.0, 0.0), 20.0, Some((2, [0, 0, 0]))), 300.0);
-        assert_eq!(field.env_temp((0.25, 0.0, 0.0), 20.0, Some((1, [1, 0, 0]))), 300.0);
+        assert_eq!(field.env_temp((0.0, 0.0, 0.0), 20.0, Some((1, [0, 0, 0]))).0, 20.0);
+        assert_eq!(field.env_temp((0.0, 0.0, 0.0), 20.0, Some((2, [0, 0, 0]))).0, 300.0);
+        assert_eq!(field.env_temp((0.25, 0.0, 0.0), 20.0, Some((1, [1, 0, 0]))).0, 300.0);
     }
 
     #[test]
@@ -2555,10 +2784,38 @@ mod tests {
     }
 
     #[test]
+    fn cannon_shots_accumulate_and_cool() {
+        let cannon = GUN_CLASSES[4];
+        // One shot seen 4 ticks later (0.02 added, 0.008 decayed): one shot's heat.
+        let e = barrel_model_step(0.0, 0.012, 4, 0.0, cannon);
+        assert!((e - cannon.1).abs() < 0.1, "{e}");
+        // Plain decay of the game's value is not a shot; the barrel only cools.
+        let cooled = barrel_model_step(0.012, 0.004, 4, e, cannon);
+        assert!(cooled < e && cooled > 0.9 * e, "{cooled}");
+        // Ten shots 4 s apart leave a clearly warm barrel.
+        let mut x = 0.0;
+        for _ in 0..10 {
+            x = barrel_model_step(0.0, 0.02, 240, x, cannon);
+        }
+        assert!(x > 80.0, "{x}");
+    }
+
+    #[test]
+    fn barrel_grades_from_chamber_to_muzzle() {
+        assert_eq!(barrel_share(1.0, 7.0), 1.0);
+        assert!((barrel_share(7.0, 7.0) - MUZZLE_HEAT_SHARE).abs() < 1e-6);
+        assert!(barrel_share(4.0, 7.0) < 1.0 && barrel_share(4.0, 7.0) > MUZZLE_HEAT_SHARE);
+        assert!((barrel_share(30.0, 7.0) - MUZZLE_HEAT_SHARE).abs() < 1e-6);
+    }
+
+    #[test]
     fn conducted_point_skips_its_own_body() {
         let mut field = FireField::default();
         field.insert((0.0, 0.0, 0.0), 200.0, Some((1, [BODY_WIDE_OWNER, 0, 0])));
-        assert_eq!(field.env_temp((0.0, 0.0, 0.0), 20.0, Some((1, [3, 0, 0]))), 20.0);
-        assert_eq!(field.env_temp((0.0, 0.0, 0.0), 20.0, Some((2, [0, 0, 0]))), 200.0);
+        assert_eq!(field.env_temp((0.0, 0.0, 0.0), 20.0, Some((1, [3, 0, 0]))).0, 20.0);
+        // Touching cells of another body get the full temperature through one link;
+        // beyond contact range nothing (it is not a radiating source).
+        assert_eq!(field.env_temp((0.0, 0.0, 0.0), 20.0, Some((2, [0, 0, 0]))), (200.0, true));
+        assert_eq!(field.env_temp((0.7, 0.0, 0.0), 20.0, Some((2, [0, 0, 0]))), (20.0, false));
     }
 }
