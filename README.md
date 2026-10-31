@@ -13,6 +13,7 @@ stormworks-infrared uses low-level techniques (DLL injection + function hooking)
 ## Download
 
 Latest release: https://github.com/dongfengmissile/stormworks_infrared/releases/latest
+Nightly release: https://github.com/dongfengmissile/stormworks_infrared/releases/tag/latest-build
 
 ## Build
 
