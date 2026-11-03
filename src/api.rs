@@ -819,6 +819,7 @@ unsafe fn scan_inner(lua: *mut c_void) -> i32 {
         // Normalised centroid (wx/ws, wy/ws, weight_sum) for the throttled
         // dump - lets a pinned-at-centre error be told apart from a real one.
         #[allow(unused_assignments)]
+        #[cfg(feature = "logging")]
         let mut diag_centroid = (0.0f64, 0.0f64, 0.0f64);
         let mut packed_vals: Vec<f64> = Vec::new();
 
@@ -858,9 +859,6 @@ unsafe fn scan_inner(lua: *mut c_void) -> i32 {
                 ));
             }
 
-            let mut weight_sum = 0.0f64;
-            let mut weight_x = 0.0f64;
-            let mut weight_y = 0.0f64;
             let az_sp = fov_rad / res_x as f64;
             let el_sp = fov_rad / res_y as f64;
             let cell_solid = az_sp * el_sp;
@@ -920,7 +918,6 @@ unsafe fn scan_inner(lua: *mut c_void) -> i32 {
                 sources.clear();
             }
             sources.retain(|s| s.sky || s.y >= sea);
-            source_count = sources.len();
             for s in sources.iter_mut() {
                 project_source(s, origin, forward, right, up);
             }
@@ -959,7 +956,6 @@ unsafe fn scan_inner(lua: *mut c_void) -> i32 {
                             None => true,
                         }
                     });
-                    source_count = sources.len();
                 }
             }
 
@@ -1159,18 +1155,22 @@ unsafe fn scan_inner(lua: *mut c_void) -> i32 {
             // Keep the raw image centroid for diagnostics only. Guidance is
             // computed from source angles above, before FOV rasterization, so a
             // sub-pixel emitter cannot disappear into a symmetric pixel blob.
-            for (index, value) in cells.iter().enumerate() {
-                let col = (index as i32 % res_x) as f64;
-                let row = (index as i32 / res_x) as f64;
-                weight_sum += value;
-                weight_x += value * (col + 0.5) / res_x as f64;
-                weight_y += value * (0.5 - (row + 0.5) / res_y as f64);
+            #[cfg(feature = "logging")]
+            {
+                let (mut weight_sum, mut weight_x, mut weight_y) = (0.0f64, 0.0f64, 0.0f64);
+                for (index, value) in cells.iter().enumerate() {
+                    let col = (index as i32 % res_x) as f64;
+                    let row = (index as i32 / res_x) as f64;
+                    weight_sum += value;
+                    weight_x += value * (col + 0.5) / res_x as f64;
+                    weight_y += value * (0.5 - (row + 0.5) / res_y as f64);
+                }
+                diag_centroid = (
+                    weight_x / weight_sum.max(1e-9),
+                    weight_y / weight_sum.max(1e-9),
+                    weight_sum,
+                );
             }
-            diag_centroid = (
-                weight_x / weight_sum.max(1e-9),
-                weight_y / weight_sum.max(1e-9),
-                weight_sum,
-            );
 
             // Normalize the display image independently of guidance.
             for value in cells.iter_mut() {

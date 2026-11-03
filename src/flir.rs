@@ -193,6 +193,7 @@ gl_table! {
     uniform2f: unsafe extern "system" fn(i32, f32, f32),
     uniform3f: unsafe extern "system" fn(i32, f32, f32, f32),
     uniform4fv: unsafe extern "system" fn(i32, i32, *const f32),
+    uniform1fv: unsafe extern "system" fn(i32, i32, *const f32),
     uniform3i: unsafe extern "system" fn(i32, i32, i32, i32),
     uniform_matrix4fv: unsafe extern "system" fn(i32, i32, u8, *const f32),
     gen_textures: unsafe extern "system" fn(i32, *mut u32),
@@ -528,6 +529,8 @@ uniform int normal_encoded;
 // set has_comp_voxel = 0.
 uniform ivec3 comp_voxel;
 uniform int has_comp_voxel;
+// Track belt links: one temperature for the whole draw (< -900 = none).
+uniform float fixed_temp;
 
 out vec4 flir_out0;
 out vec4 flir_out1;
@@ -555,7 +558,7 @@ void main()
     // surface point moved 0.0625 m back along its normal is inside its voxel.
     // Per fragment (not per vertex) so the paint is square 0.25 m cells.
     ivec3 voxel = ivec3(floor((flir_pos - normalize(flir_lnormal) * 0.0625) / 0.25 + 0.5));
-    float t = cell_temp(voxel);
+    float t = fixed_temp > -900.0 ? fixed_temp : cell_temp(voxel);
     // Geometry outside its part's listed voxels (a microcontroller's footprint
     // beyond its one definition voxel, mesh overhang): borrow the average of
     // the occupied cells around it, then the component's own origin cell.
@@ -647,6 +650,9 @@ uniform int has_hud;
 uniform vec4 plume_a[8];      // jet plume start (render space), excess C
 uniform vec4 plume_b[8];      // unit flow direction, nozzle radius
 uniform int plume_n;
+uniform vec4 blast[16];       // explosion centre (render space), scorched radius m
+uniform float blast_c[16];    // centre excess over air, C
+uniform int blast_n;
 const float DETAIL = 0.12;   // detail overlay strength in display units
 uniform float sun_soak_c;
 uniform vec3 tint;
@@ -860,6 +866,17 @@ void main()
         else
         {
             temp = terrain_temp(colour.rgb, incidence);
+            // Scorched ground where something exploded, cooling over minutes.
+            if (has_inv == 1 && has_depth == 1)
+            {
+                vec3 pos = eye + ray * dist / max(dot(ray, fwd), 1e-3);
+                for (int i = 0; i < blast_n; ++i)
+                {
+                    float q = length(pos - blast[i].xyz) / blast[i].w;
+                    if (q < 1.0)
+                        temp = max(temp, ambient_c + blast_c[i] * (1.0 - q * q));
+                }
+            }
         }
     }
 
@@ -936,6 +953,7 @@ struct BlockProgram {
     normal_encoded: i32,
     comp_voxel: i32,
     has_comp_voxel: i32,
+    fixed_temp: i32,
     has_color: i32,
     color_loc: i32,
 }
@@ -963,6 +981,9 @@ struct Composite {
     plume_a: i32,
     plume_b: i32,
     plume_n: i32,
+    blast: i32,
+    blast_c: i32,
+    blast_n: i32,
     has_inv: i32,
     water_y: i32,
     ambient_c: i32,
@@ -1026,6 +1047,7 @@ struct BlockUni {
     normal_encoded: bool,
     comp_voxel: [i32; 3],
     is_comp: bool,
+    fixed_temp: f32,
 }
 static BLOCK_UNI: Mutex<Vec<(u32, BlockUni)>> = Mutex::new(Vec::new());
 
@@ -1656,6 +1678,10 @@ unsafe fn patch_gl_slot(slot: usize, ours: usize, original: &AtomicUsize, label:
 /// median of the thermal sim's per-body ambient samples), or the fixed fallback
 /// when the sim has not stepped a body yet. Used by the main view (F10), which has
 /// no IR camera to sample at.
+pub(crate) fn scene_air_c() -> f32 {
+    scene_ambient()
+}
+
 fn scene_ambient() -> f32 {
     let value = f32::from_bits(FLIR_SCENE_AMBIENT_BITS.load(Ordering::Relaxed));
     if value.is_finite() {
@@ -2700,6 +2726,8 @@ unsafe fn snapshot_light_textures() {
     }
 }
 static LIGHT_OFFSET_Y_BITS: AtomicU32 = AtomicU32::new(0);
+/// Full graphics_offset (render origin; render = world + offset).
+static LIGHT_OFFSET: Mutex<Option<[f32; 3]>> = Mutex::new(None);
 /// The light pass's own sun_light_direction (points from the sun into the
 /// scene): what the game lights and shadows with this frame.
 static LIGHT_SUN_LOC: AtomicI32 = AtomicI32::new(-1);
@@ -2719,6 +2747,7 @@ pub(crate) extern "C" fn gl_uniform3f_hook(location: i32, x: f32, y: f32, z: f32
     }
     if location == LIGHT_OFFSET_LOC.load(Ordering::Relaxed) {
         LIGHT_OFFSET_Y_BITS.store(y.to_bits(), Ordering::Relaxed);
+        *LIGHT_OFFSET.lock().unwrap_or_else(|p| p.into_inner()) = Some([x, y, z]);
     } else if location == LIGHT_SUN_LOC.load(Ordering::Relaxed) {
         let n = (x * x + y * y + z * z).sqrt();
         if n.is_finite() && n > 1e-6 {
@@ -3160,6 +3189,7 @@ tried as a component draw, else the game draw is kept (body+{BODY_CHUNK_ITEMS:#x
     };
     t.body = body;
     let component = mapped.is_none();
+    let fixed_temp = if component { belt_link_temp(gl, program as u32, ibo as u32, count, indices, body) } else { None };
     t.reason = SK_BEGIN;
     // Breadcrumb for anything in the substitute (texture upload, our GL calls,
     // the game's driver) that can still fault.
@@ -3178,6 +3208,7 @@ tried as a component draw, else the game draw is kept (body+{BODY_CHUNK_ITEMS:#x
             indices,
             gbuffer.normal_encoded,
             &comp_to_body,
+            fixed_temp,
         ),
     };
     if guard.state.is_none() {
@@ -3670,6 +3701,31 @@ fn log_candidates(ibo: u32, what: &str, cands: &[Cand], bbox: Option<&DrawBox>, 
     }
     #[cfg(not(feature = "logging"))]
     let _ = (ibo, what, cands, bbox, chosen);
+}
+
+/// Index counts and vertex boxes (min, max; metres) of the five
+/// `component_tank_track*.mesh` links the game draws one by one along a belt.
+const BELT_LINKS: [(i32, DrawBox); 5] = [
+    (516, ([-0.18, -0.125, -0.039], [0.136, 0.125, 0.121])),
+    (516, ([-0.409, -0.625, -0.09], [0.322, 0.625, 0.281])),
+    (516, ([-0.295, -0.375, -0.065], [0.229, 0.375, 0.201])),
+    (504, ([-0.301, -0.25, -0.065], [0.224, 0.25, 0.201])),
+    (510, ([-0.18, -0.25, -0.039], [0.136, 0.25, 0.121])),
+];
+
+/// A track-belt link draw takes its body's belt temperature (the links sit in
+/// empty voxels between the wheels, so the voxel grid has nothing for them).
+unsafe fn belt_link_temp(gl: &'static Gl, program: u32, ibo: u32, count: i32, indices: *const c_void, body: usize) -> Option<f32> {
+    if !BELT_LINKS.iter().any(|l| l.0 == count) {
+        return None;
+    }
+    let temp = crate::blocktemp::belt_temp(body)?;
+    let bbox = draw_bbox(gl, program, ibo, count, indices)??;
+    let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 0.01);
+    BELT_LINKS
+        .iter()
+        .any(|l| l.0 == count && near(l.1 .0, bbox.0) && near(l.1 .1, bbox.1))
+        .then_some(temp)
 }
 
 /// Find the body for a component/unmapped draw. Returns the body and
@@ -4365,6 +4421,7 @@ unsafe fn begin_block_draw(
     indices: *const c_void,
     normal_encoded: bool,
     comp_to_body: &[f32; 16],
+    fixed_temp: Option<f32>,
 ) -> Option<SavedState> {
     let view_proj = *VIEW_PROJ.lock().unwrap_or_else(|p| p.into_inner());
     let world = *WORLD_MATRIX.lock().unwrap_or_else(|p| p.into_inner());
@@ -4401,6 +4458,8 @@ texture={} program={} game_program={program} count={count} (substitute draw foll
     });
     #[cfg(feature = "logging")]
     vertex_diag(gl, body, ibo, program as u32, count, indices, entry.min, entry.dims);
+    #[cfg(not(feature = "logging"))]
+    let _ = indices;
     if LAST_3D.swap(entry.texture, Ordering::Relaxed) != entry.texture {
         (gl.bind_texture)(GL_TEXTURE_3D, entry.texture);
     }
@@ -4416,6 +4475,7 @@ texture={} program={} game_program={program} count={count} (substitute draw foll
         normal_encoded,
         comp_voxel: [0, 1, 2].map(|i| (comp_to_body[12 + i] / 0.25).round() as i32),
         is_comp: *comp_to_body != IDENTITY,
+        fixed_temp: fixed_temp.unwrap_or(-1000.0),
     };
     let mut cache = BLOCK_UNI.lock().unwrap_or_else(|p| p.into_inner());
     let slot = cache.iter().position(|e| e.0 == block.program);
@@ -4459,6 +4519,9 @@ texture={} program={} game_program={program} count={count} (substitute draw foll
         if changed(&|l| l.is_comp == cur.is_comp) {
             (gl.uniform1i)(block.has_comp_voxel, cur.is_comp as i32);
         }
+    }
+    if block.fixed_temp >= 0 && changed(&|l| l.fixed_temp == cur.fixed_temp) {
+        (gl.uniform1f)(block.fixed_temp, cur.fixed_temp);
     }
     match slot {
         Some(i) => cache[i].1 = cur,
@@ -4710,6 +4773,7 @@ unsafe fn build_block_program(gl: &'static Gl, locations: (i32, i32), color_loc:
         has_color: uniform(gl, program, b"has_color\0"),
         color_loc,
         has_comp_voxel: uniform(gl, program, b"has_comp_voxel\0"),
+        fixed_temp: uniform(gl, program, b"fixed_temp\0"),
     };
     if block.mat_view_proj < 0
         || block.mat_world < 0
@@ -5371,6 +5435,18 @@ learned at the tonemap quad; targets seen so far: {:?}); the game's tonemap is k
         (gl.uniform4fv)(composite.plume_b, pb.len() as i32, pb.as_ptr() as *const f32);
         log_once_key(0x6a5_0010, || format!("FLIR plume: first drawn {:?} {:?}", pa[0], pb[0]));
     }
+    // Explosions: world -> render space (render = world + graphics_offset).
+    let offset = LIGHT_OFFSET.lock().unwrap_or_else(|p| p.into_inner()).unwrap_or([0.0; 3]);
+    let (mut bl, mut bc) = (Vec::new(), Vec::new());
+    for (p, r, excess) in crate::blocktemp::blast_heat().into_iter().take(16) {
+        bl.push([(p[0] + offset[0] as f64) as f32, (p[1] + offset[1] as f64) as f32, (p[2] + offset[2] as f64) as f32, r]);
+        bc.push(excess);
+    }
+    (gl.uniform1i)(composite.blast_n, bl.len() as i32);
+    if !bl.is_empty() {
+        (gl.uniform4fv)(composite.blast, bl.len() as i32, bl.as_ptr() as *const f32);
+        (gl.uniform1fv)(composite.blast_c, bc.len() as i32, bc.as_ptr());
+    }
     (gl.uniform1f)(composite.sun_soak_c, FLIR_SUN_SOAK_C);
     (gl.uniform3f)(composite.tint, config.rgb[0], config.rgb[1], config.rgb[2]);
     (gl.uniform1i)(composite.black_hot, config.black_hot as i32);
@@ -5695,6 +5771,9 @@ fn composite(gl: &'static Gl, pos_loc: u32, coord_loc: u32) -> Option<Composite>
             plume_a: uniform(gl, program, b"plume_a\0"),
             plume_b: uniform(gl, program, b"plume_b\0"),
             plume_n: uniform(gl, program, b"plume_n\0"),
+            blast: uniform(gl, program, b"blast\0"),
+            blast_c: uniform(gl, program, b"blast_c\0"),
+            blast_n: uniform(gl, program, b"blast_n\0"),
             has_inv: uniform(gl, program, b"has_inv\0"),
             water_y: uniform(gl, program, b"water_y\0"),
             ambient_c: uniform(gl, program, b"ambient_c\0"),

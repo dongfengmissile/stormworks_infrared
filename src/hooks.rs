@@ -194,6 +194,23 @@ extern "C" fn ir_exhaust_update_hook(
     }
 }
 
+static ORIG_EXPLOSION_PUSH: AtomicUsize = AtomicUsize::new(0);
+
+/// Every explosion the game spawns: note it for residual heat, then forward.
+extern "C" fn ir_explosion_push_hook(fire_body: usize, pos: *const f64, magnitude: f32, emp_radius: f32, emp_ticks: u32) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if magnitude > 0.0 && !pos.is_null() && crate::memory::readable(pos as usize, 24) {
+            let p = unsafe { [*pos, *pos.add(1), *pos.add(2)] };
+            crate::blocktemp::note_explosion(p, magnitude);
+        }
+    }));
+    let original = ORIG_EXPLOSION_PUSH.load(Ordering::SeqCst);
+    if original != 0 {
+        let f: unsafe extern "C" fn(usize, *const f64, f32, f32, u32) = unsafe { std::mem::transmute(original) };
+        unsafe { f(fire_body, pos, magnitude, emp_radius, emp_ticks) };
+    }
+}
+
 /// Sanity cap on a radiator's +0x240 temperature (coolant boils well below it).
 const FLUID_MAX_PLAUSIBLE_C: f64 = 150.0;
 
@@ -1870,6 +1887,22 @@ pub(crate) unsafe fn install_hooks() -> Result<(), String> {
         ORIG_EXHAUST_UPDATE.store(original_exhaust_update as usize, Ordering::SeqCst);
         MinHook::enable_hook(exhaust_update as *mut c_void)
             .map_err(|status| format!("MinHook enable_hook(exhaust update) failed: {status}"))?;
+    }
+
+    // Explosions: optional (residual heat only), so a mismatch only skips it.
+    let explosion_push = base + RVA_EXPLOSION_PUSH;
+    if bytes_match(explosion_push, &EXPLOSION_PUSH_PROLOGUE) {
+        match MinHook::create_hook(explosion_push as *mut c_void, ir_explosion_push_hook as *const c_void as *mut c_void) {
+            Ok(original) => {
+                ORIG_EXPLOSION_PUSH.store(original as usize, Ordering::SeqCst);
+                if MinHook::enable_hook(explosion_push as *mut c_void).is_err() {
+                    log_line("explosion hook could not be enabled; no residual blast heat");
+                }
+            }
+            Err(status) => log_line(&format!("explosion hook not created ({status:?}); no residual blast heat")),
+        }
+    } else {
+        log_line(&format!("explosion push prologue mismatch at {explosion_push:#x}; no residual blast heat"));
     }
 
     // FLIR render side: tonemap replacement, block pass and camera IR latch.

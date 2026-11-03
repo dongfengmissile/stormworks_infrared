@@ -760,13 +760,149 @@ const GUN_CLASSES: [(f32, f32, f32); 7] = [
     (0.0125, 0.3, 60.0),
     (0.025, 1.0, 90.0),
     (0.01, 0.5, 90.0),
-    (0.08, 3.0, 120.0),
-    (0.02, 12.0, 180.0),
-    (0.02, 15.0, 240.0),
-    (0.02, 25.0, 300.0),
+    (0.08, 5.0, 120.0),
+    (0.02, 7.0, 180.0),
+    (0.02, 9.0, 240.0),
+    (0.02, 11.0, 300.0),
 ];
 /// The game's heat decay per tick.
 const GUN_DECAY_PER_TICK: f32 = 0.002;
+
+// Wheels: `c_scene_vehicle_component_wheel_advanced` (def type 41: advanced
+// wheels and every tank/track wheel; physics tick 0x3ACA40). Simple wheels
+// (type 4) keep no spin/slip state and stay cold.
+const DEF_TYPE_ADVANCED_WHEEL: u32 = 41;
+const OFF_DEF_TYPE: usize = 0x2AC;
+/// Definition `flags` (+0x2B8): 0x800000 = tank (track) wheel.
+const OFF_DEF_FLAGS: usize = 0x2B8;
+const DEF_FLAG_TANK_WHEEL: u32 = 0x80_0000;
+/// Definition `wheel_radius`, m.
+const OFF_DEF_WHEEL_RADIUS: usize = 0x894;
+/// Wheel spin, revolutions per second.
+const OFF_WHEEL_RPS: usize = 0x458;
+/// Tangential slip velocity at the contact (world float3, m/s, clamped to 5).
+const OFF_WHEEL_SLIP: usize = 0x700;
+/// Hit body pointer: non-null while the wheel touches something.
+const OFF_WHEEL_CONTACT: usize = 0x7D8;
+/// Rolling heat, C/s per m/s of rolling speed (tyre ~+20 C at 20 m/s, tracks
+/// ~+25 C at 10 m/s at equilibrium), from rubber hysteresis.
+const TYRE_ROLL_C_PER_M: f32 = 0.006;
+const TRACK_ROLL_C_PER_M: f32 = 0.011;
+/// Slip heat, C/s per m/s of slip (wheelspin, skids, pivot-steering tracks):
+/// friction heats the tread ~10x faster than rolling.
+const WHEEL_SLIP_C_PER_M: f32 = 0.15;
+/// Cooling time constant standing still, s; airflow shortens it as
+/// 16 / (16 + 4 v^0.8) (tyre convection ~16 W/m2K at rest).
+const WHEEL_COOL_TAU_S: f32 = 600.0;
+const WHEEL_MAX_EXCESS_C: f32 = 150.0;
+
+/// wheel -> (tick last stepped, excess C).
+static WHEEL_MODEL: Mutex<Option<HashMap<usize, (u64, f32)>>> = Mutex::new(None);
+
+/// Tyre/track temperature above air for an advanced wheel, None for anything
+/// else. Stepped once per game tick however many bodies read it.
+unsafe fn wheel_excess(component: usize) -> Option<(f32, bool)> {
+    if !readable(component + OFF_WHEEL_CONTACT, 8) {
+        return None;
+    }
+    let def = read_usize_at(component + OFF_COMP_DEF);
+    if def < PTR_MIN || !readable(def + OFF_DEF_WHEEL_RADIUS, 4) || read_u32_at(def + OFF_DEF_TYPE) != DEF_TYPE_ADVANCED_WHEEL {
+        return None;
+    }
+    let tank = read_u32_at(def + OFF_DEF_FLAGS) & DEF_FLAG_TANK_WHEEL != 0;
+    let radius = read_f32_at(def + OFF_DEF_WHEEL_RADIUS);
+    let rps = read_f32_at(component + OFF_WHEEL_RPS);
+    let s = [0, 4, 8].map(|o| read_f32_at(component + OFF_WHEEL_SLIP + o));
+    let slip = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt();
+    let contact = read_usize_at(component + OFF_WHEEL_CONTACT) != 0;
+    let speed = (std::f32::consts::TAU * rps * radius).abs();
+    let speed = if speed.is_finite() { speed.min(200.0) } else { 0.0 };
+    let slip = if slip.is_finite() { slip.min(5.0) } else { 0.0 };
+
+    let tick = SCENE_TICKS.load(Ordering::Relaxed);
+    let mut guard = lock(&WHEEL_MODEL);
+    let map = guard.get_or_insert_with(HashMap::default);
+    if map.len() > 4096 {
+        map.retain(|_, e| tick.saturating_sub(e.0) < 60 * 60);
+    }
+    let entry = map.entry(component).or_insert((tick, 0.0));
+    let ticks = tick.saturating_sub(entry.0);
+    if ticks > 0 {
+        let roll = if tank { TRACK_ROLL_C_PER_M } else { TYRE_ROLL_C_PER_M };
+        entry.1 = wheel_step(entry.1, ticks as f32 / 60.0, speed, if contact { slip } else { 0.0 }, contact, roll);
+        entry.0 = tick;
+    }
+    Some((entry.1, tank))
+}
+
+/// Road wheels/sprockets of a track carry this share of the track heat: the
+/// rubber belt flexing on the ground is what heats up.
+const ROAD_WHEEL_SHARE: f32 = 0.4;
+/// body -> track belt temperature, C (hottest tank wheel of the body).
+static BELTS: Mutex<Option<HashMap<usize, f32>>> = Mutex::new(None);
+
+/// Temperature of the track belt drawn on `body` (render thread).
+pub(crate) fn belt_temp(body: usize) -> Option<f32> {
+    lock(&BELTS).as_ref()?.get(&body).copied()
+}
+
+/// One explicit step of the lumped tyre/track model (stable for any dt: the
+/// cooling is applied exactly).
+fn wheel_step(excess: f32, dt: f32, speed: f32, slip: f32, contact: bool, roll_c_per_m: f32) -> f32 {
+    let heat = if contact { roll_c_per_m * speed + WHEEL_SLIP_C_PER_M * slip } else { 0.0 };
+    let tau = WHEEL_COOL_TAU_S * 16.0 / (16.0 + 4.0 * speed.powf(0.8));
+    // Exact solution of dE/dt = heat - E/tau over dt.
+    let eq = heat * tau;
+    (eq + (excess - eq) * (-dt / tau).exp()).clamp(0.0, WHEEL_MAX_EXCESS_C)
+}
+
+// Explosions: residual heat where they went off (scorched ground, wreckage).
+/// Recent explosions: world position, magnitude, wall-clock ms.
+static BLASTS: Mutex<Vec<([f64; 3], f32, u64)>> = Mutex::new(Vec::new());
+const MAX_BLASTS: usize = 16;
+/// A blast is forgotten after this long, ms.
+const BLAST_LIFE_MS: u64 = 600_000;
+
+/// Called from the explosion hook (game thread).
+pub(crate) fn note_explosion(pos: [f64; 3], magnitude: f32) {
+    if !pos.iter().all(|v| v.is_finite() && v.abs() < 1.0e6) || !magnitude.is_finite() {
+        return;
+    }
+    let mut blasts = lock(&BLASTS);
+    if blasts.len() >= MAX_BLASTS {
+        blasts.remove(0);
+    }
+    blasts.push((pos, magnitude, state::now_ms()));
+    #[cfg(feature = "logging")]
+    crate::logging::log_line(&format!(
+        "blocktemp: explosion at ({:.1},{:.1},{:.1}) magnitude {magnitude:.2} -> radius {:.1} m",
+        pos[0], pos[1], pos[2], blast_radius(magnitude)
+    ));
+}
+
+/// Scorched radius, m. shortcut: the game's magnitude scale is unverified
+/// (Lua spawnExplosion takes ~0..1, one producer passes 50); retune from the
+/// logged magnitudes.
+fn blast_radius(magnitude: f32) -> f32 {
+    (1.5 + 2.5 * magnitude.max(0.0).sqrt()).clamp(2.0, 12.0)
+}
+
+/// Excess over air at the centre `age_s` after the blast: a short flash, then
+/// scorched ground/metal cooling over minutes.
+fn blast_excess(age_s: f32) -> f32 {
+    300.0 * (-age_s / 4.0).exp() + 80.0 * (-age_s / 120.0).exp()
+}
+
+/// Live blasts: (world position, radius m, centre excess C).
+pub(crate) fn blast_heat() -> Vec<([f64; 3], f32, f32)> {
+    let now = state::now_ms();
+    let mut blasts = lock(&BLASTS);
+    blasts.retain(|b| now.saturating_sub(b.2) < BLAST_LIFE_MS);
+    blasts
+        .iter()
+        .map(|&(p, m, t)| (p, blast_radius(m), blast_excess(now.saturating_sub(t) as f32 / 1000.0)))
+        .collect()
+}
 
 /// gun -> (last game heat, tick it was read, modelled barrel excess C).
 static GUN_MODEL: Mutex<Option<HashMap<usize, (f32, u64, f32)>>> = Mutex::new(None);
@@ -1926,6 +2062,11 @@ the path cube; slot_flag = any slot active byte set, presence = slot vector unre
                 }
             }
         }
+        // Explosions: wreckage at the centre stays hot for a while.
+        let air = crate::flir::scene_air_c();
+        for (p, _, excess) in blast_heat() {
+            field.insert((p[0], p[1], p[2]), air + excess, None);
+        }
         self.fire = field;
     }
 }
@@ -2115,6 +2256,8 @@ cells={} min={min:?} dims={dims:?} first_cell=({},{},{}) d0={:.0} d1={:.0} d2={:
         let mut new_bound: HashMap<usize, (f32, u32, [i32; 3], Vec3, Vec3)> = HashMap::default();
         let mut conducted: HashMap<[i32; 3], (Vec3, f32)> = HashMap::default();
         let mut guns: HashMap<usize, Option<(f32, usize)>> = HashMap::default();
+        let mut wheels: HashMap<usize, Option<(f32, bool)>> = HashMap::default();
+        let mut belt = f32::NEG_INFINITY;
         let mut barrels: HashMap<usize, Option<([i32; 3], [i32; 3], f32)>> = HashMap::default();
         let mut slot_at: HashMap<usize, usize> = HashMap::default();
         for raw in &self.pending {
@@ -2168,6 +2311,17 @@ its voxel ({},{},{}) world=({:.1},{:.1},{:.1}) source_pos=({:.1},{:.1},{:.1})",
                         None => MUZZLE_HEAT_SHARE,
                     };
                     source_c = Some(t_air + excess * share);
+                }
+            }
+            if source_c.is_none() {
+                let excess = *wheels
+                    .entry(raw.component)
+                    .or_insert_with(|| unsafe { wheel_excess(raw.component) });
+                if let Some((e, tank)) = excess {
+                    if tank {
+                        belt = belt.max(e);
+                    }
+                    source_c = Some(t_air + if tank { e * ROAD_WHEEL_SHARE } else { e });
                 }
             }
             let x = raw.x - min[0];
@@ -2229,6 +2383,18 @@ its voxel ({},{},{}) world=({:.1},{:.1},{:.1}) source_pos=({:.1},{:.1},{:.1})",
                 source_c,
                 component: raw.component,
             });
+        }
+        {
+            let mut belts = lock(&BELTS);
+            let belts = belts.get_or_insert_with(HashMap::default);
+            if belt.is_finite() {
+                if belts.len() > 1024 {
+                    belts.clear();
+                }
+                belts.insert(body_ptr, t_air + belt);
+            } else {
+                belts.remove(&body_ptr);
+            }
         }
         if hot_points.is_empty() {
             self.heat_src.remove(&body_ptr);
@@ -2784,6 +2950,20 @@ mod tests {
     }
 
     #[test]
+    fn wheels_warm_with_driving_and_slip() {
+        // Long highway run: about +20 C on tyres, about +25 C on tracks at 10 m/s.
+        let tyre = wheel_step(0.0, 3600.0, 20.0, 0.0, true, TYRE_ROLL_C_PER_M);
+        assert!((15.0..30.0).contains(&tyre), "{tyre}");
+        let track = wheel_step(0.0, 3600.0, 10.0, 0.0, true, TRACK_ROLL_C_PER_M);
+        assert!((18.0..35.0).contains(&track), "{track}");
+        // A 20 s burnout heats far faster than rolling.
+        let burn = wheel_step(0.0, 20.0, 20.0, 5.0, true, TYRE_ROLL_C_PER_M);
+        assert!(burn > 10.0 && burn > 5.0 * wheel_step(0.0, 20.0, 20.0, 0.0, true, TYRE_ROLL_C_PER_M), "{burn}");
+        // Airborne/parked: only cools.
+        assert!(wheel_step(30.0, 60.0, 0.0, 0.0, false, TYRE_ROLL_C_PER_M) < 30.0);
+    }
+
+    #[test]
     fn cannon_shots_accumulate_and_cool() {
         let cannon = GUN_CLASSES[4];
         // One shot seen 4 ticks later (0.02 added, 0.008 decayed): one shot's heat.
@@ -2797,7 +2977,7 @@ mod tests {
         for _ in 0..10 {
             x = barrel_model_step(0.0, 0.02, 240, x, cannon);
         }
-        assert!(x > 80.0, "{x}");
+        assert!(x > 8.0 * cannon.1, "{x}");
     }
 
     #[test]

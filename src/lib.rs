@@ -69,6 +69,7 @@ use windows_sys::Win32::System::LibraryLoader::{DisableThreadLibraryCalls, GetMo
 
 use crate::hooks::install_hooks;
 use crate::logging::{log_line, set_log_path};
+#[cfg(feature = "logging")]
 use std::io::Write;
 use crate::memory::self_module_path;
 use crate::offsets::{GAME_BUILD_LABEL, PLUGIN_BUILD_LABEL};

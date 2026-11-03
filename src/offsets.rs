@@ -203,6 +203,14 @@ pub(crate) const JET_RPS_TYPICAL: f64 = 10.0;
 /// Spool speed treated as full power. Jets destroy themselves somewhere past
 /// 100 RPS, so 100 is the natural "full" reference. Single tunable.
 pub(crate) const JET_RPS_FULL: f64 = 100.0;
+/// Explosion push (FUN_140308780 in f7d605, same RVA in c38c03): (fire_body,
+/// double3* world pos, float magnitude, float emp_radius, u32 emp_ticks); every
+/// server-side explosion goes through it (warheads, fuses, Lua spawnExplosion).
+pub(crate) const RVA_EXPLOSION_PUSH: usize = 0x0030_8780;
+pub(crate) const EXPLOSION_PUSH_PROLOGUE: [u8; 32] = [
+    0x40, 0x57, 0x48, 0x83, 0xec, 0x40, 0x80, 0x3d, 0xe2, 0x5e, 0x9e, 0x00, 0x00, 0x48, 0x8b, 0xfa,
+    0x0f, 0x29, 0x74, 0x24, 0x30, 0x0f, 0x28, 0xf3, 0x0f, 0x29, 0x7c, 0x24, 0x20, 0x0f, 0x28, 0xfa,
+];
 pub(crate) const RVA_EXHAUST_UPDATE: usize = 0x0030_50c0; // FUN_140302bb0(emitter, world_pos, ..., rate, ...)
 pub(crate) const EXHAUST_UPDATE_PROLOGUE: [u8; 32] = [
     0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x18, 0x4c, 0x89, 0x48, 0x20, 0x55, 0x56, 0x57, 0x41, 0x54,
