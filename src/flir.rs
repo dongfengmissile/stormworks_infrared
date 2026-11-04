@@ -193,7 +193,6 @@ gl_table! {
     uniform2f: unsafe extern "system" fn(i32, f32, f32),
     uniform3f: unsafe extern "system" fn(i32, f32, f32, f32),
     uniform4fv: unsafe extern "system" fn(i32, i32, *const f32),
-    uniform1fv: unsafe extern "system" fn(i32, i32, *const f32),
     uniform3i: unsafe extern "system" fn(i32, i32, i32, i32),
     uniform_matrix4fv: unsafe extern "system" fn(i32, i32, u8, *const f32),
     gen_textures: unsafe extern "system" fn(i32, *mut u32),
@@ -651,7 +650,7 @@ uniform vec4 plume_a[8];      // jet plume start (render space), excess C
 uniform vec4 plume_b[8];      // unit flow direction, nozzle radius
 uniform int plume_n;
 uniform vec4 blast[16];       // explosion centre (render space), scorched radius m
-uniform float blast_c[16];    // centre excess over air, C
+uniform vec4 blast_p[16];     // age s, seed 0..1
 uniform int blast_n;
 const float DETAIL = 0.12;   // detail overlay strength in display units
 uniform float sun_soak_c;
@@ -699,6 +698,99 @@ const float TWO_PI = 6.283185307;
 // FlightGear Advanced Weather diurnal surface cycle (Nasal/local_weather/
 // local_weather.nas): f = 0.5 * (1 - cos(day * 2pi - lag)), lag in radians =
 // thermal inertia (soil 0.4, water 0.9, vegetation/rock 0).
+// Explosion residue (research: drone FLIR footage, burn-scar thermography,
+// debris IR): an irregular crater elongated along the line of fire, blotchy
+// with cold holes, a few burning-residue blobs, short radial ejecta streaks, a
+// faint scorched ring and scattered hot fragments, each cooling on its own
+// time scale. All pseudorandom from the blast's seed, stable frame to frame.
+float hash12(vec2 p)
+{
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+float hash13(vec3 p)
+{
+    p = fract(p * 0.1031);
+    p += dot(p, p.zyx + 31.32);
+    return fract((p.x + p.y) * p.z);
+}
+float vnoise3(vec3 p)
+{
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    vec3 u = f * f * (3.0 - 2.0 * f);
+    float a = mix(hash13(i), hash13(i + vec3(1.0, 0.0, 0.0)), u.x);
+    float b = mix(hash13(i + vec3(0.0, 1.0, 0.0)), hash13(i + vec3(1.0, 1.0, 0.0)), u.x);
+    float c = mix(hash13(i + vec3(0.0, 0.0, 1.0)), hash13(i + vec3(1.0, 0.0, 1.0)), u.x);
+    float d = mix(hash13(i + vec3(0.0, 1.0, 1.0)), hash13(i + vec3(1.0, 1.0, 1.0)), u.x);
+    return mix(mix(a, b, u.y), mix(c, d, u.y), u.z);
+}
+float fbm3(vec3 p)
+{
+    float s = 0.0;
+    float a = 0.5;
+    for (int k = 0; k < 4; ++k)
+    {
+        s += a * vnoise3(p);
+        p = p * 2.03 + 17.1;
+        a *= 0.5;
+    }
+    return s / 0.9375;
+}
+// d: offset from the blast centre (render space, m), n: surface normal,
+// R: crater radius (m), px: metres per pixel here. Excess over air, C.
+// Noise is 3D so walls and slopes get the same pattern as flat ground (a
+// ground-plane projection smears it vertically there).
+float blast_temp(vec3 d, vec3 n, float R, float age, float seed, float px)
+{
+    vec3 o = vec3(seed * 91.7, seed * 53.3, seed * 27.9);
+    vec3 dir = vec3(cos(seed * 6.2831), 0.0, sin(seed * 6.2831));
+    float stretch = 1.0 + 0.4 * fract(seed * 7.31);
+    vec3 e = d - dir * dot(d, dir) * (1.0 - 1.0 / stretch);  // line of fire
+    float r = length(e) / R;
+    float edge = fbm3(d / R * 1.7 + o);
+    float rr = r / (0.55 + 0.9 * edge);                      // ragged rim, +-45%
+    // Crater floor: blotchy, with cold holes (ejecta, rocks).
+    float floorn = fbm3(d / R * 3.1 + o.zxy);
+    float crater = (1.0 - smoothstep(0.6, 1.0, rr)) * smoothstep(0.28, 0.42, floorn);
+    float t = crater * (400.0 * exp(-age) + (150.0 * exp(-age / 150.0) + 40.0 * exp(-age / 900.0)) * (0.2 + 1.3 * floorn * floorn));
+    // Burning residue blobs.
+    float blob = smoothstep(0.66, 0.82, fbm3(d / R * 2.3 + o + 5.0)) * (1.0 - smoothstep(0.9, 1.4, rr));
+    t = max(t, blob * 220.0 * exp(-age / 300.0));
+    // Scorched ring: modest, outlives the skin.
+    float ring = smoothstep(0.9, 1.15, rr) * (1.0 - smoothstep(1.4, 2.0, rr)) * (0.4 + edge);
+    t = max(t, ring * 15.0 * exp(-age / 600.0));
+    // Short radial ejecta streaks (direction from the centre).
+    vec3 u = d / max(length(d), 1e-4);
+    float rays = pow(vnoise3(u * 16.0 + o), 16.0);
+    float len = 0.8 + 1.6 * vnoise3(u * 5.0 + o.yzx);
+    float streak = rays * smoothstep(0.8, 1.1, r) * exp(-max(r - 1.0, 0.0) / (0.5 * len)) * step(r, 1.0 + 2.0 * len);
+    t = max(t, streak * 120.0 * exp(-age / 60.0));
+    // Hot fragments on the surface's own plane, denser near the centre; each
+    // cools on its own (40-120 s) and burning bits flicker. Sub-pixel ones keep
+    // their total signal.
+    vec3 t1 = normalize(cross(abs(n.y) > 0.7 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0), n));
+    vec3 t2 = cross(n, t1);
+    int nf = R > 1.0 ? 24 : 8;
+    float rad = max(0.08 * sqrt(R), 1.5 * px);
+    float gain = min(1.0, pow(0.08 * sqrt(R) / rad, 2.0) * 2.0);
+    for (int k = 0; k < nf; ++k)
+    {
+        float h1 = hash12(vec2(seed * 113.0 + float(k), 1.37));
+        float h2 = hash12(vec2(float(k) * 1.91, seed * 77.0));
+        float h3 = hash12(vec2(seed * 31.0, float(k) * 2.73));
+        float fr = R * (0.8 + 3.2 * h1 * h1);
+        vec3 fp = (t1 * cos(h2 * 6.2831) + t2 * sin(h2 * 6.2831)) * fr;
+        if (length(d - fp) < rad)
+        {
+            float flick = 0.8 + 0.2 * sin(age * (1.0 + 4.0 * h3) + h1 * 20.0);
+            t = max(t, 350.0 * exp(-age / (40.0 + 80.0 * h3)) * flick * gain);
+        }
+    }
+    return t;
+}
+
 float diurnal(float lag)
 {
     return 0.5 * (1.0 - cos(day_pct * TWO_PI - lag));
@@ -767,6 +859,9 @@ void main()
         ray = normalize(b.xyz / b.w - eye);
         fwd = normalize(e.xyz / e.w - c.xyz / c.w);
     }
+    // Metres per pixel on the surface (explosion fragments), taken here in
+    // uniform control flow where screen derivatives are defined.
+    float px_m = min(length(dFdx(eye + ray * max(dist, 0.0) / max(dot(ray, fwd), 1e-3))), 0.5);
     // The game's moon/sun sprites sit ~18 km out: unmarked geometry that high
     // above the sea is sky, not terrain.
     if (has_inv == 1 && has_depth == 1 && !sky && !marked_any
@@ -872,9 +967,10 @@ void main()
                 vec3 pos = eye + ray * dist / max(dot(ray, fwd), 1e-3);
                 for (int i = 0; i < blast_n; ++i)
                 {
-                    float q = length(pos - blast[i].xyz) / blast[i].w;
-                    if (q < 1.0)
-                        temp = max(temp, ambient_c + blast_c[i] * (1.0 - q * q));
+                    vec3 d = pos - blast[i].xyz;
+                    float R = blast[i].w;
+                    if (dot(d, d) < 25.0 * R * R)
+                        temp = max(temp, ambient_c + blast_temp(d, n, R, blast_p[i].x, blast_p[i].y, px_m));
                 }
             }
         }
@@ -982,7 +1078,7 @@ struct Composite {
     plume_b: i32,
     plume_n: i32,
     blast: i32,
-    blast_c: i32,
+    blast_p: i32,
     blast_n: i32,
     has_inv: i32,
     water_y: i32,
@@ -3392,6 +3488,11 @@ fn body_reach2(body: usize) -> f32 {
 /// Newest chunk matrix per (view, body); entries older than the previous frame
 /// are dropped, so a lookup sees this frame's matrices (fallback: last frame's).
 static BODY_MATS: Mutex<Vec<BodyMat>> = Mutex::new(Vec::new());
+/// Per view kind: (frame, lo, hi) around every body's grid reach, rebuilt at the
+/// first component lookup of a frame from the bodies recorded so far (the
+/// previous frame's are still listed); the margin covers a frame of motion.
+static VIEW_BOUNDS: Mutex<[(u64, [f32; 3], [f32; 3]); 3]> = Mutex::new([(u64::MAX, [0.0; 3], [0.0; 3]); 3]);
+const BOUNDS_MARGIN_M: f32 = 20.0;
 #[cfg(feature = "logging")]
 static COMP_LOGGED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
@@ -3743,6 +3844,30 @@ unsafe fn resolve_component(
     let view = ACTIVE_VIEW.load(Ordering::Relaxed);
     let first = indices as usize / 2;
     let t = [comp[12], comp[13], comp[14]];
+    // Most draws that get here are terrain and props nowhere near a vehicle
+    // (~150k/s with FLIR on): reject them against one box per view instead of
+    // locking and walking every body.
+    {
+        let frame = FRAME.load(Ordering::Relaxed);
+        let mut bounds = VIEW_BOUNDS.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = &mut bounds[(view as usize).min(2)];
+        if slot.0 != frame {
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for e in BODY_MATS.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+                if e.view == view && e.reach2.is_finite() {
+                    let r = e.reach2.sqrt() + BOUNDS_MARGIN_M;
+                    for i in 0..3 {
+                        lo[i] = lo[i].min(e.mat[12 + i] - r);
+                        hi[i] = hi[i].max(e.mat[12 + i] + r);
+                    }
+                }
+            }
+            *slot = (frame, lo, hi);
+        }
+        if (0..3).any(|i| !(t[i] >= slot.1[i] && t[i] <= slot.2[i])) {
+            return None;
+        }
+    }
     let close = |a: f32, b: f32| (a - b).abs() <= 1e-3;
     let mut exact: Vec<Cand> = Vec::new();
     let mut near: Vec<Cand> = Vec::new();
@@ -5437,15 +5562,15 @@ learned at the tonemap quad; targets seen so far: {:?}); the game's tonemap is k
     }
     // Explosions: world -> render space (render = world + graphics_offset).
     let offset = LIGHT_OFFSET.lock().unwrap_or_else(|p| p.into_inner()).unwrap_or([0.0; 3]);
-    let (mut bl, mut bc) = (Vec::new(), Vec::new());
-    for (p, r, excess) in crate::blocktemp::blast_heat().into_iter().take(16) {
+    let (mut bl, mut bp) = (Vec::new(), Vec::new());
+    for (p, r, age, seed) in crate::blocktemp::blast_heat().into_iter().rev().take(16) {
         bl.push([(p[0] + offset[0] as f64) as f32, (p[1] + offset[1] as f64) as f32, (p[2] + offset[2] as f64) as f32, r]);
-        bc.push(excess);
+        bp.push([age, seed, 0.0, 0.0]);
     }
     (gl.uniform1i)(composite.blast_n, bl.len() as i32);
     if !bl.is_empty() {
         (gl.uniform4fv)(composite.blast, bl.len() as i32, bl.as_ptr() as *const f32);
-        (gl.uniform1fv)(composite.blast_c, bc.len() as i32, bc.as_ptr());
+        (gl.uniform4fv)(composite.blast_p, bp.len() as i32, bp.as_ptr() as *const f32);
     }
     (gl.uniform1f)(composite.sun_soak_c, FLIR_SUN_SOAK_C);
     (gl.uniform3f)(composite.tint, config.rgb[0], config.rgb[1], config.rgb[2]);
@@ -5772,7 +5897,7 @@ fn composite(gl: &'static Gl, pos_loc: u32, coord_loc: u32) -> Option<Composite>
             plume_b: uniform(gl, program, b"plume_b\0"),
             plume_n: uniform(gl, program, b"plume_n\0"),
             blast: uniform(gl, program, b"blast\0"),
-            blast_c: uniform(gl, program, b"blast_c\0"),
+            blast_p: uniform(gl, program, b"blast_p\0"),
             blast_n: uniform(gl, program, b"blast_n\0"),
             has_inv: uniform(gl, program, b"has_inv\0"),
             water_y: uniform(gl, program, b"water_y\0"),

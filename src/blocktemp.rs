@@ -857,50 +857,115 @@ fn wheel_step(excess: f32, dt: f32, speed: f32, slip: f32, contact: bool, roll_c
 }
 
 // Explosions: residual heat where they went off (scorched ground, wreckage).
-/// Recent explosions: world position, magnitude, wall-clock ms.
+/// Recent explosions: world position, radius m, wall-clock ms.
 static BLASTS: Mutex<Vec<([f64; 3], f32, u64)>> = Mutex::new(Vec::new());
 const MAX_BLASTS: usize = 16;
 /// A blast is forgotten after this long, ms.
-const BLAST_LIFE_MS: u64 = 600_000;
+const BLAST_LIFE_MS: u64 = 1_800_000;
+/// One explosion shows up several times (the push, its main/small effect
+/// emitters, every update of those): sightings this close in space and time
+/// are the same blast.
+const BLAST_MERGE_MS: u64 = 10_000;
+/// Hot crater radius of a `main_explosion` effect (warheads, missiles, cannon
+/// HE) and of the small `explosion` effect, m. Research: a 105-155 mm shell
+/// leaves a ~1-2 m crater and a ~3-6 m hot area; fragments, streaks and the
+/// scorched ring reach further (see the composite's blast_temp).
+const BLAST_MAIN_RADIUS_M: f32 = 1.5;
+const BLAST_SMALL_RADIUS_M: f32 = 0.5;
 
-/// Called from the explosion hook (game thread).
+/// Called from the explosion push hook (game thread; host only, Lua and fuses).
 pub(crate) fn note_explosion(pos: [f64; 3], magnitude: f32) {
-    if !pos.iter().all(|v| v.is_finite() && v.abs() < 1.0e6) || !magnitude.is_finite() {
+    if magnitude.is_finite() {
+        note_blast(pos, blast_radius(magnitude), "push");
+    }
+}
+
+/// Called from the particle-effect hook for the game's explosion effects
+/// (warheads and shells; runs on clients too).
+pub(crate) fn note_explosion_effect(pos: [f64; 3], main: bool) {
+    note_blast(pos, if main { BLAST_MAIN_RADIUS_M } else { BLAST_SMALL_RADIUS_M }, if main { "main effect" } else { "effect" });
+}
+
+/// Projectile impact from the local sim (type: projectile table index, 6-9 =
+/// the autocannon range, >= 10 also spawns main_explosion; kind 0 kinetic,
+/// 1 HE, 2 fragmentation, 3 AP, 4 incendiary - 1/3/4 confirmed in game by
+/// firing each). HE and frag leave a small scorch; the big shells are already
+/// caught through their main_explosion effect. Kinetic/AP barely warm the
+/// ground, and incendiary only flashes unless it lights something.
+pub(crate) fn note_impact(pos: [f64; 3], ty: i32, kind: i32) {
+    #[cfg(feature = "logging")]
+    {
+        static SEEN: Mutex<Vec<(i32, i32)>> = Mutex::new(Vec::new());
+        let mut seen = lock(&SEEN);
+        if seen.len() < 64 && !seen.contains(&(ty, kind)) {
+            seen.push((ty, kind));
+            crate::logging::log_line(&format!(
+                "blocktemp: first projectile impact type={ty} kind={kind} at ({:.1},{:.1},{:.1})",
+                pos[0], pos[1], pos[2]
+            ));
+        }
+    }
+    if (kind == 1 || kind == 2) && (6..=9).contains(&ty) {
+        // Projectile size 0.2/0.3/0.6 for types 7/8/9 (table +0x10): a 20-40 mm
+        // HE round leaves a ~0.3-0.6 m hot patch.
+        let size = [0.15f32, 0.2, 0.3, 0.6][(ty - 6) as usize];
+        note_blast(pos, 0.25 + 0.5 * size, "small HE");
+    }
+}
+
+fn note_blast(pos: [f64; 3], radius: f32, what: &str) {
+    if !pos.iter().all(|v| v.is_finite() && v.abs() < 1.0e6) {
         return;
     }
+    let now = state::now_ms();
     let mut blasts = lock(&BLASTS);
+    let near = |p: &[f64; 3], r: f32| {
+        let d2 = (0..3).map(|i| (p[i] - pos[i]).powi(2)).sum::<f64>();
+        d2 <= (r.max(radius) as f64).powi(2)
+    };
+    if let Some(b) = blasts.iter_mut().find(|b| now.saturating_sub(b.2) < BLAST_MERGE_MS && near(&b.0, b.1)) {
+        b.1 = b.1.max(radius);
+        return;
+    }
     if blasts.len() >= MAX_BLASTS {
         blasts.remove(0);
     }
-    blasts.push((pos, magnitude, state::now_ms()));
+    blasts.push((pos, radius, now));
     #[cfg(feature = "logging")]
     crate::logging::log_line(&format!(
-        "blocktemp: explosion at ({:.1},{:.1},{:.1}) magnitude {magnitude:.2} -> radius {:.1} m",
-        pos[0], pos[1], pos[2], blast_radius(magnitude)
+        "blocktemp: explosion ({what}) at ({:.1},{:.1},{:.1}) radius {radius:.1} m",
+        pos[0], pos[1], pos[2]
     ));
+    #[cfg(not(feature = "logging"))]
+    let _ = what;
 }
 
 /// Scorched radius, m. shortcut: the game's magnitude scale is unverified
 /// (Lua spawnExplosion takes ~0..1, one producer passes 50); retune from the
 /// logged magnitudes.
 fn blast_radius(magnitude: f32) -> f32 {
-    (1.5 + 2.5 * magnitude.max(0.0).sqrt()).clamp(2.0, 12.0)
+    (0.5 + 1.0 * magnitude.max(0.0).sqrt()).clamp(0.5, 5.0)
 }
 
-/// Excess over air at the centre `age_s` after the blast: a short flash, then
-/// scorched ground/metal cooling over minutes.
+/// Crater-floor excess over air `age_s` after the blast (same terms as the
+/// composite's blast_temp): fireball flash (~1 s), surface skin (~150 s,
+/// burn-scar measurements), bulk crater soil (~15 min).
 fn blast_excess(age_s: f32) -> f32 {
-    300.0 * (-age_s / 4.0).exp() + 80.0 * (-age_s / 120.0).exp()
+    400.0 * (-age_s).exp() + 250.0 * (-age_s / 150.0).exp() + 60.0 * (-age_s / 900.0).exp()
 }
 
-/// Live blasts: (world position, radius m, centre excess C).
-pub(crate) fn blast_heat() -> Vec<([f64; 3], f32, f32)> {
+/// Live blasts: (world position, crater radius m, age s, seed 0..1).
+pub(crate) fn blast_heat() -> Vec<([f64; 3], f32, f32, f32)> {
     let now = state::now_ms();
     let mut blasts = lock(&BLASTS);
     blasts.retain(|b| now.saturating_sub(b.2) < BLAST_LIFE_MS);
     blasts
         .iter()
-        .map(|&(p, m, t)| (p, blast_radius(m), blast_excess(now.saturating_sub(t) as f32 / 1000.0)))
+        .map(|&(p, r, t)| {
+            // Stable per blast: its position bits.
+            let h = (p[0].to_bits() ^ p[2].to_bits().rotate_left(21) ^ t).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (p, r, now.saturating_sub(t) as f32 / 1000.0, (h >> 40) as f32 / (1u64 << 24) as f32)
+        })
         .collect()
 }
 
@@ -2064,8 +2129,8 @@ the path cube; slot_flag = any slot active byte set, presence = slot vector unre
         }
         // Explosions: wreckage at the centre stays hot for a while.
         let air = crate::flir::scene_air_c();
-        for (p, _, excess) in blast_heat() {
-            field.insert((p[0], p[1], p[2]), air + excess, None);
+        for (p, _, age, _) in blast_heat() {
+            field.insert((p[0], p[1], p[2]), air + blast_excess(age), None);
         }
         self.fire = field;
     }

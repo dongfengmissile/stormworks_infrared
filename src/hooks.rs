@@ -129,6 +129,13 @@ extern "C" fn ir_exhaust_update_hook(
                     }
                 }
 
+                // Explosion effects (main_explosion 21 = warheads, explosion
+                // 16 = shells): residual heat where they went off.
+                if (index == 16 || index == 21) && positioned {
+                    let p = [read_f64_at(position), read_f64_at(position + 8), read_f64_at(position + 0x10)];
+                    crate::blocktemp::note_explosion_effect(p, index == 21);
+                }
+
                 if let Some(temp) = exhaust_index_temperature(index) {
                     if rate <= EMITTER_MIN_RATE {
                         // The plume has stopped: drop the source rather than
@@ -209,6 +216,34 @@ extern "C" fn ir_explosion_push_hook(fire_body: usize, pos: *const f64, magnitud
         let f: unsafe extern "C" fn(usize, *const f64, f32, f32, u32) = unsafe { std::mem::transmute(original) };
         unsafe { f(fire_body, pos, magnitude, emp_radius, emp_ticks) };
     }
+}
+
+static ORIG_PROJECTILE_IMPACT: AtomicUsize = AtomicUsize::new(0);
+
+/// Every projectile impact of the local sim: note it, then forward unchanged
+/// (the 7th argument is a stack byte; its whole slot is passed through).
+extern "C" fn ir_projectile_impact_hook(
+    fx: usize,
+    proj: usize,
+    hit: usize,
+    pos: usize,
+    normal: usize,
+    dir: usize,
+    flag: usize,
+) -> usize {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        if readable(proj, 8) && readable(pos, 24) {
+            let p = [read_f64_at(pos), read_f64_at(pos + 8), read_f64_at(pos + 16)];
+            crate::blocktemp::note_impact(p, read_u32_at(proj) as i32, read_u32_at(proj + 4) as i32);
+        }
+    }));
+    let original = ORIG_PROJECTILE_IMPACT.load(Ordering::SeqCst);
+    if original == 0 {
+        return 0;
+    }
+    let f: unsafe extern "C" fn(usize, usize, usize, usize, usize, usize, usize) -> usize =
+        unsafe { std::mem::transmute(original) };
+    unsafe { f(fx, proj, hit, pos, normal, dir, flag) }
 }
 
 /// Sanity cap on a radiator's +0x240 temperature (coolant boils well below it).
@@ -1903,6 +1938,22 @@ pub(crate) unsafe fn install_hooks() -> Result<(), String> {
         }
     } else {
         log_line(&format!("explosion push prologue mismatch at {explosion_push:#x}; no residual blast heat"));
+    }
+
+    // Projectile impacts (small HE shells): optional like the explosion hook.
+    let impact = base + RVA_PROJECTILE_IMPACT;
+    if bytes_match(impact, &PROJECTILE_IMPACT_PROLOGUE) {
+        match MinHook::create_hook(impact as *mut c_void, ir_projectile_impact_hook as *const c_void as *mut c_void) {
+            Ok(original) => {
+                ORIG_PROJECTILE_IMPACT.store(original as usize, Ordering::SeqCst);
+                if MinHook::enable_hook(impact as *mut c_void).is_err() {
+                    log_line("projectile impact hook could not be enabled; no small-shell scorch");
+                }
+            }
+            Err(status) => log_line(&format!("projectile impact hook not created ({status:?}); no small-shell scorch")),
+        }
+    } else {
+        log_line(&format!("projectile impact prologue mismatch at {impact:#x}; no small-shell scorch"));
     }
 
     // FLIR render side: tonemap replacement, block pass and camera IR latch.
