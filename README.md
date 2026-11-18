@@ -4,10 +4,10 @@ A plugin for [Stormworks: Build and Rescue](https://store.steampowered.com/app/5
 
 ## READ THIS FIRST
 
-stormworks-infrared uses low-level techniques (DLL injection + function hooking) to extend the game, because there is no supported way to do it.
+stormworks-infrared uses low-level techniques (a DLL loaded into the game + function hooking) to extend the game, because there is no supported way to do it.
 
-- No guarantees about stability. Every function the plugin hooks is verified against a known byte pattern first, and if it doesn't match (usually after a game update) that hook is skipped and the plugin says so in its log instead of patching blindly — but injection itself can still be a bad time.
-- **Antivirus software might flag it.** Injecting into another process is exactly what malware does, so this is expected. If you want to be sure what it does, read the source and build it yourself.
+- No guarantees about stability. Every function the plugin hooks is verified against a known byte pattern first, and if it doesn't match (usually after a game update) that hook is skipped and the plugin says so in its log instead of patching blindly — but hooking a game is never fully safe.
+- **Antivirus software might flag it.** Loading code into another program and hooking it is exactly what malware does, so this is expected. If you want to be sure what it does, read the source and build it yourself.
 - It does not modify any game files on disk.
 
 ## Download
@@ -34,15 +34,22 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## Usage
 
-1. Start Stormworks and load into a world.
-2. Inject `StormworksInfrared.dll` into `stormworks64.exe` — either with the bundled `infrared_inject.exe` or any other DLL injector.
+1. Install the [Stormworks proxy mod loader](https://github.com/dongfengmissile/stormworks_proxy_mod_loader): copy its `dbghelp.dll` next to `stormworks64.exe`.
+2. Copy `StormworksInfrared.dll` into `<Stormworks install>/Mods/`.
+3. Start the game. The plugin loads automatically at launch.
 
-On Linux, the game runs under Proton, so the injector has to run inside the same Proton prefix Steam created for Stormworks (573090) rather than a bare WINE prefix.
+On Linux, add this to the game's Steam launch options so Proton uses the loader:
+
+```
+WINEDLLOVERRIDES="dbghelp=n,b" %command%
+```
+
+To turn the plugin off, rename it to `StormworksInfrared.dll.disabled`.
 
 You should see a line in the log confirming the hooks installed and the `ir` table was registered. Logs go to:
 
 ```
-<Stormworks install>/logs/infrared_bootstrap.log
+<Stormworks install>/Mods/logs/infrared_bootstrap.log
 ```
 
 The debug build additionally carries a diagnostic dump: weather, sun, scan direction, source list, source position and more.

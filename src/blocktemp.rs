@@ -82,7 +82,7 @@ const OFF_DEF_CELLS: usize = 0xA8;
 // Guns: one class `c_scene_vehicle_component_weapon` for every gun (RE: tick
 // 0x429B60 adds a per-class amount per shot, decays 0.002/tick; the red glow
 // draw 0x42FF20 reads the same field).
-const WEAPON_VTABLE_RVA: usize = 0x00af_d290;
+const WEAPON_VTABLE_RVA: usize = 0x00af_e1f0;
 /// f32 0..1 overheat fraction (1.0 = overheated, smoking, cannot fire).
 const OFF_WEAPON_HEAT: usize = 0x384;
 /// Barrel extension / muzzle piece -> the gun it is chained to.
