@@ -16,7 +16,7 @@ What happened, and what did you expect?
 3. 
 
 ## Log
-Attach `<Stormworks install>/logs/infrared_bootstrap.log`. Remove any sensitive information before sharing.
+Attach `<Stormworks install>/UserData/logs/infrared_bootstrap.log`. Remove any sensitive information before sharing.
 
 ## Environment
 - Stormworks Infrared version:

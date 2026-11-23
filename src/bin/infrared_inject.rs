@@ -277,14 +277,10 @@ mod imp {
             let _ = CloseHandle(process);
 
             if exit_code == LOAD_LIBRARY_FAILED_EXIT_CODE {
-                let log_hint = dll_path
-                    .parent()
-                    .map(|dir| dir.join("logs").join("infrared_bootstrap.log"))
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "logs\\infrared_bootstrap.log".to_string());
-                return Err(format!(
-                    "remote LoadLibraryW returned 0; check {log_hint} for details"
-                ));
+                return Err(
+                    "remote LoadLibraryW returned 0; check <Stormworks>\\UserData\\logs\\infrared_bootstrap.log for details"
+                        .to_string(),
+                );
             }
         }
 

@@ -1518,17 +1518,11 @@ fn log_debug(message: impl FnOnce() -> String) {
 // Installation
 // ---------------------------------------------------------------------------
 
-/// Marker file next to the DLL (`<plugin>/infrared_disable_*`). The log lives in
-/// `<plugin>/logs/`, so the directory is its grandparent.
+/// Marker file next to the DLL (`<plugin>/infrared_disable_*`).
 fn marker_exists(name: &str) -> bool {
-    let path = crate::state::LOG_PATH
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    let Some(log_path) = path else { return false };
-    let Some(logs) = log_path.parent() else { return false };
-    let Some(plugin_dir) = logs.parent() else { return false };
-    plugin_dir.join(name).exists()
+    crate::memory::self_module_path()
+        .and_then(|dll| Some(dll.parent()?.join(name)))
+        .is_some_and(|path| path.exists())
 }
 
 /// Install the FLIR hooks and GL dispatch slots. Each piece is independent and

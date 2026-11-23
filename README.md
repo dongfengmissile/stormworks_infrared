@@ -42,7 +42,7 @@ On Linux, the game runs under Proton, so the injector has to run inside the same
 You should see a line in the log confirming the hooks installed and the `ir` table was registered. Logs go to:
 
 ```
-<Stormworks install>/logs/infrared_bootstrap.log
+<Stormworks install>/UserData/logs/infrared_bootstrap.log
 ```
 
 The debug build additionally carries a diagnostic dump: weather, sun, scan direction, source list, source position and more.

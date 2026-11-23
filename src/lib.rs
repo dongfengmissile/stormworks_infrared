@@ -128,7 +128,8 @@ fn bootstrap() {
         return;
     };
     let plugin_dir = dll_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let log_dir = plugin_dir.join("logs");
+    let game_dir = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.to_path_buf()));
+    let log_dir = game_dir.unwrap_or_else(|| plugin_dir.to_path_buf()).join("UserData").join("logs");
     let _ = fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("infrared_bootstrap.log");
     if log_path.exists() {

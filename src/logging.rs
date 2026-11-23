@@ -1,4 +1,4 @@
-//! The single log file (`logs/infrared_bootstrap.log`), truncated once per
+//! The single log file (`UserData/logs/infrared_bootstrap.log`), truncated once per
 //! game launch. Everything else logs through `log_line`.
 
 use std::fs::{self, OpenOptions};
