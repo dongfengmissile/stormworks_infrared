@@ -50,6 +50,7 @@ mod fx;
 mod heat;
 mod hooks;
 mod ir;
+mod keys;
 mod logging;
 mod lua;
 mod memory;
@@ -383,7 +384,6 @@ pub extern "system" fn DllMain(module: HINSTANCE, reason: u32, reserved: *mut c_
         let spawned = thread::Builder::new()
             .name("stormworks-infrared-bootstrap".to_string())
             .spawn(|| {
-                thread::sleep(Duration::from_millis(500));
                 bootstrap();
             });
         if spawned.is_err() {

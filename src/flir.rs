@@ -2964,8 +2964,7 @@ fn f10_toggled() -> bool {
         return F10_ON.load(Ordering::Relaxed);
     }
     LAST_POLL_US.store(now, Ordering::Relaxed);
-    let f: unsafe extern "system" fn(i32) -> i16 = unsafe { std::mem::transmute(address) };
-    let down = (unsafe { f(0x79) } as u16) & 0x8000 != 0; // VK_F10
+    let down = crate::keys::FLIR_VIEW.down().unwrap_or(false);
     if down && !KEY_HELD.swap(true, Ordering::Relaxed) {
         let now_on = !F10_ON.load(Ordering::Relaxed);
         F10_ON.store(now_on, Ordering::Relaxed);
@@ -3404,7 +3403,7 @@ fn dump_step() {
     if !cfg!(debug_assertions) {
         return;
     }
-    if let Some(down) = async_key_down(0x77) {
+    if let Some(down) = crate::keys::DRAW_DUMP.down() {
         if down && !F8_HELD.swap(true, Ordering::Relaxed) {
             if DUMP_STATE.load(Ordering::Relaxed) == 0 {
                 DUMP_STATE.store(1, Ordering::Relaxed);
@@ -5679,7 +5678,7 @@ colour {}, depth {})",
     true
 }
 
-fn async_key_down(vk: i32) -> Option<bool> {
+pub(crate) fn async_key_down(vk: i32) -> Option<bool> {
     static GET_KEY_STATE: OnceLock<usize> = OnceLock::new();
     let address = *GET_KEY_STATE.get_or_init(|| unsafe {
         let module = LoadLibraryA(b"user32.dll\0".as_ptr());
