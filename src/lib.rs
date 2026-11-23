@@ -58,6 +58,7 @@ mod offsets;
 mod sources;
 mod state;
 mod sun;
+mod unload;
 
 use std::ffi::c_void;
 use std::fs;
@@ -123,7 +124,16 @@ fn install_panic_hook() {
     }));
 }
 
+/// Sets `unload::BOOTED` when dropped: after the hooks are in, or at any early return.
+struct Booted;
+impl Drop for Booted {
+    fn drop(&mut self) {
+        crate::unload::BOOTED.store(true, Ordering::SeqCst);
+    }
+}
+
 fn bootstrap() {
+    let booted = Booted;
     let Some(dll_path) = self_module_path() else {
         return;
     };
@@ -168,7 +178,13 @@ fn bootstrap() {
             let _ = fs::write(&path, b"");
             let mut beat = 0u64;
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(10));
+                // 1 s steps: an unload waits for this thread to end.
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if crate::unload::STOP.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
                 beat += 1;
                 let custom = crate::state::MODULAR_TICK_CALLS.load(Ordering::Relaxed);
                 let preset = crate::state::PRESET_TICK_CALLS.load(Ordering::Relaxed);
@@ -355,11 +371,15 @@ uniforms, rocket/jet/preset/modular/water/steam ticks, exhaust)",
             return;
         }
     }
+    drop(booted);
 
     // Keep the worker alive so the log stays writable and the DLL is not
     // considered idle; also report registrar activity periodically.
     for _ in 0..600 {
         thread::sleep(Duration::from_secs(1));
+        if crate::unload::STOP.load(Ordering::Relaxed) {
+            break;
+        }
         if REGISTRAR_HITS.load(Ordering::Relaxed) > 0 {
             log_line(&format!(
                 "ir table registered {} time(s)",

@@ -134,6 +134,21 @@ mod veil {
     /// Append-only handle on the bootstrap log, opened once at install time so
     /// the handler itself only has to `WriteFile`.
     static LOG_HANDLE: AtomicUsize = AtomicUsize::new(0);
+    /// `AddVectoredExceptionHandler`'s cookie, for the unload.
+    static VEH: AtomicUsize = AtomicUsize::new(0);
+
+    /// Unload: the handler out, the log closed (its NtTerminateProcess hook goes with the others).
+    pub(super) fn uninstall() {
+        use windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler;
+        let veh = VEH.swap(0, Ordering::SeqCst);
+        if veh != 0 {
+            unsafe { RemoveVectoredExceptionHandler(veh as *const std::ffi::c_void) };
+        }
+        let log = LOG_HANDLE.swap(0, Ordering::SeqCst);
+        if log != 0 {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(log as windows_sys::Win32::Foundation::HANDLE) };
+        }
+    }
     /// Re-entrancy guard: a fault inside the handler (a guarded page, a bad
     /// stack) returns immediately instead of recursing.
     static IN_HANDLER: AtomicBool = AtomicBool::new(false);
@@ -167,7 +182,7 @@ mod veil {
         unsafe {
             // first = 0: run after the game's own handlers, so this only sees
             // what nobody else handled.
-            let _ = AddVectoredExceptionHandler(0, Some(handler));
+            VEH.store(AddVectoredExceptionHandler(0, Some(handler)) as usize, Ordering::SeqCst);
             hook_terminate();
         }
     }
@@ -453,4 +468,10 @@ pub(crate) fn install(log_path: &std::path::Path) {
     veil::install(log_path);
     #[cfg(not(feature = "logging"))]
     let _ = log_path;
+}
+
+/// Takes the fault handler out again (plugin unload).
+pub(crate) fn uninstall() {
+    #[cfg(feature = "logging")]
+    veil::uninstall();
 }

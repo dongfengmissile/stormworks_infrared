@@ -1703,6 +1703,23 @@ unsafe fn install_code_hook(
     }
 }
 
+/// GL dispatch slots re-pointed at us: (slot, ours, the game's pointer).
+static PATCHED_SLOTS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+
+/// Unload: every GL dispatch slot still pointing at us gets the game's pointer back.
+pub(crate) unsafe fn restore_gl_slots() {
+    for (slot, ours, previous) in PATCHED_SLOTS.lock().unwrap_or_else(|p| p.into_inner()).drain(..) {
+        if *(slot as *const usize) != ours {
+            continue;
+        }
+        let mut old: PAGE_PROTECTION_FLAGS = 0;
+        if VirtualProtect(slot as *const c_void, std::mem::size_of::<usize>(), PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+            *(slot as *mut usize) = previous;
+            VirtualProtect(slot as *const c_void, std::mem::size_of::<usize>(), old, &mut old);
+        }
+    }
+}
+
 /// Re-point a GL dispatch slot at `ours`, keeping the previous pointer as the
 /// forwarding target. Both known slots (`0x140A935F8` IAT entry,
 /// `0x140CE3268`/`0x140CE5688` GLEW globals) are plain pointer variables, so the
@@ -1710,6 +1727,9 @@ unsafe fn install_code_hook(
 /// accepted when it points into a loaded module, so a wrong RVA or an
 /// uninitialised slot cannot be published as the forwarding target.
 unsafe fn patch_gl_slot(slot: usize, ours: usize, original: &AtomicUsize, label: &str) {
+    if crate::unload::STOP.load(Ordering::SeqCst) {
+        return; // unloading: nothing new may point into the plugin
+    }
     let target = slot;
     if !readable(target, std::mem::size_of::<usize>()) {
         log_debug(|| {
@@ -1748,6 +1768,7 @@ unsafe fn patch_gl_slot(slot: usize, ours: usize, original: &AtomicUsize, label:
     }
     original.store(previous, Ordering::SeqCst);
     *(target as *mut usize) = ours;
+    PATCHED_SLOTS.lock().unwrap_or_else(|p| p.into_inner()).push((target, ours, previous));
     let mut ignored: PAGE_PROTECTION_FLAGS = 0;
     let _ = VirtualProtect(
         target as *const c_void,
