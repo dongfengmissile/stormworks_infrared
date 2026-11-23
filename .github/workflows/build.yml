@@ -35,10 +35,32 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Caches the MinGW .debs; on a hit they're installed with dpkg, skipping apt-get update and the download.
+      # ImageOS (e.g. ubuntu24) is a runner variable, so it isn't visible to ${{ env }}; expose it as an output.
+      - id: image
+        run: echo "os=$ImageOS" >> "$GITHUB_OUTPUT"
+
+      - name: Cache MinGW packages
+        id: mingw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/mingw-debs
+          # Bump v1 to force a refresh.
+          key: mingw-debs-${{ steps.image.outputs.os }}-v1
+
       - name: Install Windows cross compiler and Rust
+        timeout-minutes: 10
+        env:
+          PKGS: gcc-mingw-w64-x86-64-posix
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends gcc-mingw-w64-x86-64-posix
+          if [ "${{ steps.mingw-cache.outputs.cache-hit }}" != "true" ] || ! sudo dpkg -i ~/mingw-debs/*.deb; then
+            # Cache miss or stale cache (runner image changed): download into our own folder, then install normally.
+            sudo apt-get update
+            mkdir -p ~/mingw-debs/partial
+            sudo apt-get install --yes --no-install-recommends --download-only -o Dir::Cache::archives="$HOME/mingw-debs" $PKGS
+            sudo rm -rf ~/mingw-debs/partial ~/mingw-debs/lock
+            sudo apt-get install --yes --no-install-recommends --fix-broken $PKGS
+          fi
           rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
 
       # Keeps the downloaded crates and their compiled output between runs.
