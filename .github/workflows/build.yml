@@ -5,6 +5,10 @@ on:
     branches: ['**']
   workflow_dispatch:
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -25,8 +29,8 @@ jobs:
             archive: stormworks_infrared.zip
             features: ""
     env:
-      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-      CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc-posix
+      CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc-posix
       AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
     steps:
       - uses: actions/checkout@v6
@@ -34,8 +38,13 @@ jobs:
       - name: Install Windows cross compiler and Rust
         run: |
           sudo apt-get update
-          sudo apt-get install --yes gcc-mingw-w64-x86-64 zip
+          sudo apt-get install --yes --no-install-recommends gcc-mingw-w64-x86-64-posix
           rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
+
+      # Keeps the downloaded crates and their compiled output between runs.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.profile }}
 
       - name: Build DLL and injector
         env:
